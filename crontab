@@ -1,0 +1,2 @@
+# Daily UBKI upload pass at 06:00 Kyiv time (container TZ=Europe/Kyiv)
+0 6 * * * python -m app.run_once

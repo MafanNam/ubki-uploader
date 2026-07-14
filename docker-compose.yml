@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    # localhost only: access in prod via SSH tunnel
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file: .env
+    environment:
+      UBKI_DATA_FOLDER_PATH: /ubki-data
+      DB_PATH: /data/ubki.sqlite3
+    volumes:
+      - ./data:/data
+      - ${UBKI_DATA_FOLDER_PATH}:/ubki-data
+
+  scheduler:
+    build: .
+    restart: unless-stopped
+    command: ["supercronic", "-json", "/srv/ubki-uploader/crontab"]
+    env_file: .env
+    environment:
+      UBKI_DATA_FOLDER_PATH: /ubki-data
+      DB_PATH: /data/ubki.sqlite3
+    volumes:
+      - ./data:/data
+      - ${UBKI_DATA_FOLDER_PATH}:/ubki-data
