@@ -1,0 +1,13 @@
+.git
+.idea
+.venv
+.pytest_cache
+__pycache__
+*.py[cod]
+.env
+data/
+ubki-data/
+tests/
+CLAUDE.md
+README.md
+docker-compose.yml

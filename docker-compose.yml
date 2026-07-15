@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   api:
     build: .
@@ -12,6 +18,13 @@ services:
     volumes:
       - ./data:/data
       - ${UBKI_DATA_FOLDER_PATH}:/ubki-data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
 
   scheduler:
     build: .
@@ -24,3 +37,4 @@ services:
     volumes:
       - ./data:/data
       - ${UBKI_DATA_FOLDER_PATH}:/ubki-data
+    logging: *default-logging
