@@ -7,6 +7,7 @@ The DB reflects facts of transmission — no CRUD beyond retry status resets.
 from __future__ import annotations
 
 import hmac
+import json
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,17 @@ from .config import Config, load_config
 from .jsonlog import setup_logging
 
 STALE_RUN_AFTER = timedelta(hours=25)
+
+
+def _maybe_json(text: str | None):
+    """ubki_response is stored as raw text; present it as an object when it
+    parses (truncated/non-JSON bodies stay as-is)."""
+    if not text:
+        return text
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -113,7 +125,13 @@ def create_app(config: Config | None = None) -> FastAPI:
             " created_at, sent_at FROM records WHERE file_id = ? ORDER BY line_no",
             (file_id,),
         ).fetchall()
-        return {"file": dict(row), "records": [dict(r) for r in records]}
+        return {
+            "file": dict(row),
+            "records": [
+                dict(r) | {"ubki_response": _maybe_json(r["ubki_response"])}
+                for r in records
+            ],
+        }
 
     @app.post("/files/{file_id}/retry", dependencies=[Depends(require_token)])
     def retry_file(file_id: int, conn=Depends(get_conn)):

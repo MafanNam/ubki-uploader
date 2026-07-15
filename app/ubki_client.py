@@ -41,6 +41,9 @@ REQREASON_TRANSMISSION = "0"
 # branch; on a 200 body 2001 means "unexpected error" per the wiki, so it must
 # NOT trigger a re-auth.
 SESSION_EXPIRED_ERRCODES = {"2014"}
+# stored into records.ubki_response; generous enough that a full sentdatainfo
+# with items[] survives intact (a truncated body no longer parses as JSON)
+RESPONSE_TEXT_LIMIT = 8192
 
 
 class UbkiAuthError(Exception):
@@ -263,17 +266,17 @@ class UbkiClient:
         if resp.status_code >= 500:
             return UploadResult(
                 status=FAILED, http_status=resp.status_code,
-                response_text=text[:2000], error=f"HTTP {resp.status_code}",
+                response_text=text[:RESPONSE_TEXT_LIMIT], error=f"HTTP {resp.status_code}",
                 is_network_error=True,
             )
         if resp.status_code != 200:
             return UploadResult(
                 status=FAILED, http_status=resp.status_code,
-                response_text=text[:2000], error=f"HTTP {resp.status_code}",
+                response_text=text[:RESPONSE_TEXT_LIMIT], error=f"HTTP {resp.status_code}",
             )
         return UploadResult(
             status=FAILED, http_status=resp.status_code,
-            response_text=text[:2000], error="non-JSON response",
+            response_text=text[:RESPONSE_TEXT_LIMIT], error="non-JSON response",
         )
 
     @staticmethod
@@ -283,7 +286,7 @@ class UbkiClient:
         if state is None:
             state = _find_key(data, "state")
         state = str(state).lower() if state is not None else None
-        response_text = text[:2000]
+        response_text = text[:RESPONSE_TEXT_LIMIT]
 
         if state in ("ok", "nt"):
             detail = _rejection_detail(info)
