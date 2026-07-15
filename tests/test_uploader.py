@@ -115,6 +115,58 @@ def test_recovery_after_abort_sends_pending_and_failed(cfg):
     assert record_statuses(cfg) == [SENT, SENT, SENT]
 
 
+def test_aborted_pass_is_not_a_successful_run(cfg):
+    write_jsonl(cfg.data_folder, "a.jsonl", LINES)
+    run_pass(cfg, client=FakeClient([network_failed_result()]))
+
+    conn = db.connect(cfg.db_path)
+    try:
+        run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        assert run["status"] == "aborted"
+        assert "consecutive network errors" in run["error"]
+        # health's 25h rule must keep working through a UBKI outage
+        assert db.last_successful_run(conn) is None
+    finally:
+        conn.close()
+
+
+def test_persistent_session_rejection_aborts_pass(cfg):
+    """'session rejected twice' is network-like: no per-record auth storm."""
+    lines = [f'{{"inn":"{i}"}}' for i in range(5)]
+    write_jsonl(cfg.data_folder, "a.jsonl", lines)
+    stale = UploadResult(status=FAILED, error="session rejected twice", is_network_error=True)
+    client = FakeClient([stale])
+    summary = run_pass(cfg, client=client)
+
+    assert summary.aborted is True
+    assert len(client.calls) == cfg.network_abort_threshold
+
+
+def test_empty_file_marked_sent_and_archived(cfg):
+    write_jsonl(cfg.data_folder, "empty.jsonl", ["", "  "])
+    client = FakeClient([sent_result()])
+    run_pass(cfg, client=client)
+
+    assert client.calls == []
+    row = file_row(cfg)
+    assert row["lines_total"] == 0
+    assert row["status"] == SENT
+    assert row["archived_at"] is not None
+    assert (cfg.archive_folder / "empty.jsonl").exists()
+
+
+def test_line_under_limit_but_envelope_over_is_rejected(cfg):
+    # the raw line squeaks under 2 MiB, but the envelope pushes the request over
+    line = '{"x":"' + "a" * (cfg.max_line_bytes - 20) + '"}'
+    write_jsonl(cfg.data_folder, "a.jsonl", [line])
+    client = FakeClient([sent_result()])
+    summary = run_pass(cfg, client=client)
+
+    assert client.calls == []
+    assert summary.records_rejected == 1
+    assert record_statuses(cfg) == [REJECTED]
+
+
 def test_oversized_line_rejected_locally(cfg):
     write_jsonl(cfg.data_folder, "a.jsonl", ['{"x":"' + "a" * (2 * 1024 * 1024) + '"}'])
     client = FakeClient([sent_result()])

@@ -31,11 +31,11 @@ def seed_file(cfg, statuses: list[str]) -> int:
     return file_id
 
 
-def seed_run(cfg, finished_at: str) -> None:
+def seed_run(cfg, finished_at: str, status: str = "success") -> None:
     conn = db.connect(cfg.db_path)
     conn.execute(
-        "INSERT INTO runs (started_at, finished_at, status) VALUES (?, ?, 'success')",
-        (finished_at, finished_at),
+        "INSERT INTO runs (started_at, finished_at, status) VALUES (?, ?, ?)",
+        (finished_at, finished_at, status),
     )
     conn.commit()
     conn.close()
@@ -84,6 +84,26 @@ def test_health_degraded_on_failed_over_cap(api, cfg):
     body = api.get("/health").json()
     assert body["status"] == "degraded"
     assert any("retry cap" in reason for reason in body["reasons"])
+
+
+def test_health_ignores_aborted_runs(api, cfg):
+    seed_run(cfg, iso(datetime.now(timezone.utc)), status="aborted")
+    body = api.get("/health").json()
+    assert body["status"] == "degraded"
+    assert "no successful run yet" in body["reasons"]
+
+
+# --- runs --------------------------------------------------------------------
+
+def test_runs_listing_newest_first(api, cfg):
+    seed_run(cfg, iso(datetime.now(timezone.utc) - timedelta(hours=2)))
+    seed_run(cfg, iso(datetime.now(timezone.utc)), status="aborted")
+    body = api.get("/runs").json()
+    assert [r["status"] for r in body["runs"]] == ["aborted", "success"]
+
+    assert len(api.get("/runs", params={"limit": 1}).json()["runs"]) == 1
+    assert api.get("/runs", params={"limit": 0}).status_code == 422
+    assert api.get("/runs", params={"limit": 500}).status_code == 422
 
 
 # --- files -------------------------------------------------------------------

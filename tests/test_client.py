@@ -148,6 +148,165 @@ def test_expired_session_reauths_once(cfg):
     assert calls == {"auth": 2, "upload": 2}
 
 
+def test_main_errcode_2014_in_sentdatainfo_reauths_once(cfg):
+    calls = {"auth": 0, "upload": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            calls["auth"] += 1
+            return httpx.Response(200, json=AUTH_OK)
+        calls["upload"] += 1
+        if calls["upload"] == 1:
+            return upload_response({"sentdatainfo": {
+                "state": "er", "main_errcode": 2014,
+                "items": [{"errtype": "CRITICAL", "errcode": 2014, "msg": "no session"}],
+            }})
+        return upload_response({"sentdatainfo": {"state": "ok", "ok": 1, "er": 0, "ig": 0}})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == SENT
+    assert calls == {"auth": 2, "upload": 2}
+
+
+def test_item_errcode_2001_in_rejection_does_not_reauth(cfg):
+    """Per-component errcodes inside items[] must never trigger a re-auth."""
+    calls = {"auth": 0, "upload": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            calls["auth"] += 1
+            return httpx.Response(200, json=AUTH_OK)
+        calls["upload"] += 1
+        return upload_response({"sentdatainfo": {
+            "state": "er", "main_errcode": 2001, "ok": 0, "er": 1,
+            "items": [{"errtype": "CRITICAL", "errcode": 2001, "msg": "unexpected error"}],
+        }})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == REJECTED
+    assert calls == {"auth": 1, "upload": 1}
+
+
+def test_ig_counter_maps_to_sent_with_warning(cfg):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return upload_response({"sentdatainfo": {
+            "state": "ok", "main_errcode": 0, "ok": 2, "nt": 0, "ig": 1, "er": 0, "sy": 0,
+            "items": [{"errtype": "IGNORED", "errcode": 2045, "msg": "date in the future"}],
+        }})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == SENT
+    assert result.has_warnings is True
+
+
+def test_rejection_error_includes_items_detail(cfg):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return upload_response({"sentdatainfo": {
+            "state": "er", "main_errcode": 2031, "ok": 0, "er": 1,
+            "items": [{"errtype": "CRITICAL", "errcode": 2031, "msg": "невірний ІПН"}],
+        }})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == REJECTED
+    assert "rejected by UBKI (state=er)" in result.error
+    assert "main_errcode=2031" in result.error
+    assert "невірний ІПН" in result.error
+
+
+def test_http_400_with_er_body_is_rejected_not_failed(cfg):
+    """UBKI pairs validation rejections with HTTP 400 (observed live): the
+    body's state=er must win over the HTTP code and map to `rejected`."""
+    calls = {"auth": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            calls["auth"] += 1
+            return httpx.Response(200, json=AUTH_OK)
+        return httpx.Response(400, json={
+            "reqinfo": {"reqid": "IN#X", "reqidout": "rid1"},
+            "http_status": 400,
+            "sentdatainfo": {
+                "inn": "0000000000", "ok": 0, "nt": 1, "ig": 0, "er": 4, "sy": 0,
+                "items": [
+                    {"tag": "IDENT", "compid": 1, "errtype": "CRITICAL", "errcode": 2078,
+                     "msg": "Відсутній валідний блок ідентифікації"},
+                    {"tag": "CRDEAL", "compid": 2, "errtype": "NOTICE", "errcode": 5001,
+                     "msg": "OK NEW"},
+                ],
+                "state": "er", "main_errcode": 2077,
+            },
+        })
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == REJECTED
+    assert result.is_network_error is False
+    assert result.http_status == 400
+    assert "main_errcode=2077" in result.error
+    assert "2078" in result.error
+    assert calls["auth"] == 1  # no re-auth on a validation rejection
+
+
+def test_http_400_without_state_stays_failed(cfg):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return httpx.Response(400, json={"message": "gateway said no"})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == FAILED
+    assert result.error == "HTTP 400"
+    assert result.is_network_error is False
+
+
+def test_sy_state_counts_as_network_error(cfg):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return upload_response({"sentdatainfo": {"state": "sy", "main_errcode": 1000}})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == FAILED
+    assert result.is_network_error is True
+
+
+def test_session_rejected_twice_is_network_error(cfg):
+    """Persistent 401 on upload must count toward the pass abort (no per-record
+    auth storm: UBKI forbids frequent re-auth)."""
+    calls = {"auth": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            calls["auth"] += 1
+            return httpx.Response(200, json=AUTH_OK)
+        return httpx.Response(401, text="unauthorized")
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == FAILED
+    assert result.error == "session rejected twice"
+    assert result.is_network_error is True
+    assert calls["auth"] == 2  # initial + the single re-auth
+
+
 class MemoryStore:
     def __init__(self, sessid=None):
         self.sessid = sessid
