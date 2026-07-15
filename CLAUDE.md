@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this service does
 
-Daily push of credit data to UBKI (Ukrainian credit bureau). JSONL files land in `UBKI_DATA_FOLDER_PATH`; each non-empty line is one subject and is sent as **one HTTP request** to UBKI. Successfully processed files move to `archive/`; per-line state lives in SQLite so nothing is ever sent twice. A read-only FastAPI facade (localhost-only, SSH tunnel in prod) exposes statuses and manual retries.
+Daily push of credit data to UBKI (Ukrainian credit bureau). Data files (`.txt`, JSONL inside: the line is the bare subject object **without** a `{"fo_cki": …}` wrapper) land in `UBKI_DATA_FOLDER_PATH`; each non-empty line is one subject and is sent as **one HTTP request** to UBKI. Successfully processed files move to `archive/`; per-line state lives in SQLite so nothing is ever sent twice. A read-only FastAPI facade (localhost-only, SSH tunnel in prod) exposes statuses and manual retries.
 
 ## Commands
 
@@ -36,7 +36,7 @@ Key invariants that span multiple files:
 - **Status model** (`app/db.py`): records are `pending|sent|failed|rejected`; file status is a pure aggregate recomputed by `recompute_file_status` (a file ingested with zero records counts as `sent` and gets archived). UBKI response mapping (in `ubki_client._map_state`, reads `sentdatainfo`): `ok`/`nt` → `sent` (`nt` and `ig > 0` = accepted with warnings, counted for alerts), `er` → `rejected` (manual retry only; `last_error` carries `main_errcode` + `items[].msg`), `sy`/network/5xx → `failed` (auto-retried next pass until `attempts >= retry_cap`, default 5). Partial rejection (`er > 0` counter inside an accepted response) → `rejected`. A body carrying `state` wins over the HTTP code — UBKI pairs validation rejections with **HTTP 400** (confirmed live), and those are `rejected`, not retryable failures.
 - **Session handling**: UBKI sessid is valid until 23:59:59 Kyiv time and UBKI asks to authenticate once per day. `DbSessionStore` (uploader) caches it in the `meta` table keyed by Kyiv date; `UbkiClient` re-auths once on `sentdatainfo.main_errcode`/top-level errcode 2014 or HTTP 401/403, then retries the record. Per-component `errcode`s inside `items[]` must never trigger a re-auth; "session rejected twice" is network-like (see abort) so a dead session can't cause a per-record auth storm (UBKI forbids frequent auth).
 - **Abort semantics**: 3 consecutive network-like errors (transport, 5xx, `state=sy`, dead session) abort the pass (UBKI is down); remaining records stay `pending` for the next pass, and the run is recorded as `runs.status='aborted'` — **not** `success` — so the health 25h rule keeps working through an outage. `UploadResult.is_network_error` is what drives the abort — set it correctly for any new failure mode.
-- **Scan filter**: only files matching `FILE_GLOB` (default `*.jsonl`) are picked up; anything else in the folder is logged (`file_skipped_pattern`) and never sent.
+- **Scan filter**: only files matching `FILE_GLOB` (default `*.txt` — the producer always delivers `.txt`) are picked up; anything else in the folder is logged (`file_skipped_pattern`) and never sent.
 - **Health** (`GET /health`): `degraded` when the last *successful run* (not send — days with zero files are healthy; `aborted` runs don't count) is older than 25h, or when rejected / failed-beyond-cap records exist. `GET /runs` lists pass history.
 
 UBKI protocol details (endpoints, envelope shape, wiki links, error codes) are documented in the docstring of `app/ubki_client.py`.
@@ -48,6 +48,8 @@ UBKI protocol details (endpoints, envelope shape, wiki links, error codes) are d
 - Python 3.12 in Docker; local venv is 3.14 — don't use 3.13+-only features.
 - The API is deliberately not CRUD: the DB records transmission facts. The only mutations are the token-guarded retry endpoints (`failed|rejected` → `pending`) and `POST /run`.
 
-## Not yet done
+## Live verification status
 
-Confirmed live on `test.ubki.ua` (2026-07-15, with a seeded sessid): the full transport works — envelope accepted, session honored, per-component validation runs, `reqidout` of 32 chars echoed back. Validation rejections arrive as **HTTP 400** with `sentdatainfo.state=er` in the body (handled: body `state` wins over the HTTP code). The auth endpoint enforces an IP whitelist (error 278); `upload/data` itself does not. A fully **successful** send (`state=ok`) is still pending: the current test lines lack the mandatory `ident`/`docs`/`addr`/`contacts` blocks (errcodes 2078/2077/2072/2074), so the data producer must add them (the `deals` block already validates as "OK NEW").
+Fully confirmed end-to-end on `test.ubki.ua` (2026-07-15, seeded sessid): **`state=ok` received**, record `sent`, file archived. Validation rejections arrive as **HTTP 400** with `sentdatainfo.state=er` in the body (handled: body `state` wins over the HTTP code). The auth endpoint enforces an IP whitelist (error 278; `upload/data` itself does not) — seed a session with `python -m app.set_session <sessid>` when authing from a non-whitelisted IP.
+
+Data-side requirements discovered live (for the data producer): the line is the bare subject object (no `fo_cki` wrapper); all of `idents`/`docs`/`addrs`/`contacts` blocks are mandatory (2078/2077/2072/2074); contacts need a **valid phone** — made-up numbers are dropped (IGNORED 3013; on the test contour use the doc's official test numbers, e.g. `+380981220000`) and test-looking emails too (3017); deals older than the transmission window are dropped (IGNORED 3019); a new deal with a stale doc `vdate` warns (3022); the test base substitutes fake INNs and surnames (NOTICE 5009).

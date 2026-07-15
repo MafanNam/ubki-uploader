@@ -121,6 +121,25 @@ def test_files_listing_and_details(api, cfg):
     assert api.get("/files", params={"status": "nope"}).status_code == 422
 
 
+def test_file_details_presents_ubki_response_as_json(api, cfg):
+    file_id = seed_file(cfg, [SENT, FAILED])
+    conn = db.connect(cfg.db_path)
+    conn.execute(
+        "UPDATE records SET ubki_response = ? WHERE file_id = ? AND line_no = 1",
+        ('{"sentdatainfo":{"state":"ok","ok":1}}', file_id),
+    )
+    conn.execute(
+        "UPDATE records SET ubki_response = ? WHERE file_id = ? AND line_no = 2",
+        ("<html>bad gateway</html>", file_id),
+    )
+    conn.commit()
+    conn.close()
+
+    records = api.get(f"/files/{file_id}").json()["records"]
+    assert records[0]["ubki_response"] == {"sentdatainfo": {"state": "ok", "ok": 1}}
+    assert records[1]["ubki_response"] == "<html>bad gateway</html>"  # non-JSON stays raw
+
+
 # --- POST auth ----------------------------------------------------------------
 
 @pytest.mark.parametrize("path", ["/files/1/retry", "/records/1/retry", "/run"])

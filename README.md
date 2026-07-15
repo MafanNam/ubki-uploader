@@ -2,13 +2,13 @@
 
 Щоденна передача кредитних даних до УБКІ (Українське бюро кредитних історій).
 
-JSONL-файли з'являються у папці `UBKI_DATA_FOLDER_PATH`; кожен непорожній рядок — один суб'єкт кредитної історії, який відправляється **одним HTTP-запитом** на `upload/data`. Стан кожного рядка живе в SQLite, тому ніщо не відправляється двічі. Повністю оброблені файли переїжджають в `archive/`. Read-only FastAPI-фасад (тільки localhost, у проді — через SSH-тунель) показує статуси і дозволяє ручні ретраї.
+Файли з даними (`.txt`, всередині — JSONL: один JSON-об'єкт на рядок) з'являються у папці `UBKI_DATA_FOLDER_PATH`; кожен непорожній рядок — один суб'єкт кредитної історії, який відправляється **одним HTTP-запитом** на `upload/data`. Рядок — це «чисті» дані суб'єкта **без обгортки `{"fo_cki": …}`**: сервіс сам загортає його в конверт `{"reqtype","reqidout","reqreason","data":{"fo_cki":<рядок>}}`. Стан кожного рядка живе в SQLite, тому ніщо не відправляється двічі. Повністю оброблені файли переїжджають в `archive/`. Read-only FastAPI-фасад (тільки localhost, у проді — через SSH-тунель) показує статуси і дозволяє ручні ретраї.
 
 ## Як це працює
 
 ```
 06:00 Kyiv (supercronic)                  ┌──────────────┐
-python -m app.run_once ──► flock ──► scan │ *.jsonl > 5хв│──► ingest (нові filename+sha256)
+python -m app.run_once ──► flock ──► scan │ *.txt  > 5хв │──► ingest (нові filename+sha256)
                                           └──────────────┘         │ рядки → records(pending)
                                                                    ▼
 Telegram-алерт ◄── runs row ◄── archive/ ◄── усі records термінальні ◄── послідовна відправка
@@ -46,7 +46,7 @@ docker compose up -d        # api (127.0.0.1:8000) + scheduler (крон 06:00 K
 | `UBKI_URL` | ні | `https://secure.ubki.ua/upload/data` | тест-контур: `https://test.ubki.ua/upload/data` |
 | `UBKI_AUTH_URL` | ні | `https://secure.ubki.ua/b2_api_xml/ubki/auth` | тест: `https://test.ubki.ua/b2_api_xml/ubki/auth` |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | ні | — | алерти; без них — no-op |
-| `FILE_GLOB` | ні | `*.jsonl` | які файли брати з папки; решта логується і не чіпається |
+| `FILE_GLOB` | ні | `*.txt` | які файли брати з папки; решта логується і не чіпається |
 | `DB_PATH` | ні | `/data/ubki.sqlite3` | ставиться compose'ом |
 | `RETRY_CAP` | ні | `5` | межа авторетраїв для `failed` |
 | `MIN_FILE_AGE_SEC` | ні | `300` | захист від недописаних файлів |

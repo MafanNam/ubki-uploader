@@ -36,6 +36,7 @@ def cfg(tmp_path: Path) -> Config:
         db_path=tmp_path / "data" / "ubki.sqlite3",
         api_token="secret-token",
         min_file_age_sec=300,
+        file_glob="*.jsonl",  # prod default is *.txt; tests use .jsonl names
     )
 
 
