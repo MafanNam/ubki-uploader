@@ -25,6 +25,7 @@ class Config:
     telegram_chat_id: str | None = None
     retry_cap: int = 5
     min_file_age_sec: int = 300
+    file_glob: str = "*.jsonl"
     max_line_bytes: int = 2 * 1024 * 1024
     network_abort_threshold: int = 3
     http_timeout_sec: float = 60.0
@@ -58,4 +59,5 @@ def load_config() -> Config:
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,
         retry_cap=int(os.environ.get("RETRY_CAP", "5")),
         min_file_age_sec=int(os.environ.get("MIN_FILE_AGE_SEC", "300")),
+        file_glob=os.environ.get("FILE_GLOB", "").strip() or "*.jsonl",
     )

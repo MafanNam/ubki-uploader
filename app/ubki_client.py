@@ -6,7 +6,13 @@ spaces/Specification page 117342209):
 - auth:   POST {UBKI_AUTH_URL}  body {"doc": {"auth": {"login", "pass"}}}
           response contains `sessid`, valid until 23:59:59 Kyiv time same day
 - upload: POST {UBKI_URL}       body {"reqtype","reqidout","reqreason","data":{"fo_cki":...}}
-          header `SessId`; response `state` in ok|nt|er|sy + ok/nt/er counters
+          header `SessId`; response payload lives under `sentdatainfo`:
+          {"sentdatainfo": {"state": ok|nt|er|sy, "main_errcode": N,
+                            "ok"/"nt"/"ig"/"er"/"sy": counters,
+                            "items": [{"errtype", "errcode", "msg", ...}]}}
+          (confirmed live on test.ubki.ua 2026-07-14). Counter semantics:
+          nt = accepted with notices, ig = component dropped but package
+          accepted, er = component caused package rejection.
 
 The raw JSONL line is embedded into the envelope byte-for-byte (the service
 must not parse or validate file contents).
@@ -30,9 +36,11 @@ log = logging.getLogger("ubki.client")
 
 REQTYPE_UPDATE = "u"  # 'd' (deletion) is out of scope for v1
 REQREASON_TRANSMISSION = "0"
-# 2014 = no active session (doc); 2001 = UNAUTHORIZED validation.session.is.expired
-# (observed live on test.ubki.ua, arrives with HTTP 401)
-SESSION_EXPIRED_ERRCODES = {"2014", "2001"}
+# 2014 = no active session (doc) -> re-auth once and retry. 2001 (session
+# expired, observed live) arrives with HTTP 401 and is handled by the 401/403
+# branch; on a 200 body 2001 means "unexpected error" per the wiki, so it must
+# NOT trigger a re-auth.
+SESSION_EXPIRED_ERRCODES = {"2014"}
 
 
 class UbkiAuthError(Exception):
@@ -77,6 +85,47 @@ def _find_key(data, key: str):
             if found is not None:
                 return found
     return None
+
+
+def _sentdatainfo(data) -> dict:
+    """The documented upload response keeps its payload under `sentdatainfo`;
+    fall back to the body itself for flat/variant layouts."""
+    if isinstance(data, dict):
+        info = data.get("sentdatainfo")
+        if isinstance(info, dict):
+            return info
+        return data
+    return {}
+
+
+def _counter(info: dict, key: str) -> int:
+    try:
+        return int(info.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rejection_detail(info: dict) -> str:
+    """main_errcode + first item messages — goes into records.last_error so the
+    rejection reason is readable without digging through the raw response."""
+    parts = []
+    main = info.get("main_errcode")
+    if main not in (None, "", 0, "0"):
+        parts.append(f"main_errcode={main}")
+    items = info.get("items")
+    if isinstance(items, list):
+        for item in items[:3]:
+            if not isinstance(item, dict):
+                continue
+            code = " ".join(
+                str(item[key]) for key in ("errtype", "errcode") if item.get(key) is not None
+            )
+            msg = item.get("msg")
+            if code and msg:
+                parts.append(f"[{code}] {msg}")
+            elif code or msg:
+                parts.append(str(msg or code))
+    return "; ".join(parts)[:500]
 
 
 def build_envelope(raw_line: str, reqidout: str) -> bytes:
@@ -152,8 +201,11 @@ class UbkiClient:
             sessid = self.auth()
         except UbkiAuthError as exc:
             return UploadResult(status=FAILED, error=str(exc), is_network_error=True)
+        # A session rejected even after a fresh auth means nothing will go
+        # through this pass (and re-authing per record is exactly what UBKI
+        # forbids) — flag it network-like so the 3-strike abort kicks in.
         return self._post_record(raw_line, reqidout, sessid) or UploadResult(
-            status=FAILED, error="session rejected twice"
+            status=FAILED, error="session rejected twice", is_network_error=True
         )
 
     def _post_record(self, raw_line: str, reqidout: str, sessid: str) -> UploadResult | None:
@@ -181,6 +233,33 @@ class UbkiClient:
             )
             self._sessid = None
             return None
+
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+
+        if data is not None:
+            # Session errors surface as sentdatainfo.main_errcode (or a
+            # top-level errcode in flat variants). Per-component errcodes
+            # inside items[] must never trigger a re-auth.
+            info = _sentdatainfo(data)
+            errcode = info.get("main_errcode")
+            if errcode is None and isinstance(data, dict):
+                errcode = data.get("errcode")
+            if errcode is not None and str(errcode) in SESSION_EXPIRED_ERRCODES:
+                self._sessid = None
+                return None
+            # A body carrying `state` is authoritative over the HTTP code:
+            # UBKI pairs validation rejections (state=er) with HTTP 400
+            # (observed live 2026-07-15), and those must map to `rejected`,
+            # not to a retryable HTTP failure.
+            state = info.get("state")
+            if state is None:
+                state = _find_key(data, "state")
+            if resp.status_code == 200 or state is not None:
+                return self._map_state(data, resp.status_code, text)
+
         if resp.status_code >= 500:
             return UploadResult(
                 status=FAILED, http_status=resp.status_code,
@@ -192,53 +271,52 @@ class UbkiClient:
                 status=FAILED, http_status=resp.status_code,
                 response_text=text[:2000], error=f"HTTP {resp.status_code}",
             )
-
-        try:
-            data = resp.json()
-        except ValueError:
-            return UploadResult(
-                status=FAILED, http_status=resp.status_code,
-                response_text=text[:2000], error="non-JSON response",
-            )
-
-        errcode = _find_key(data, "errcode")
-        if errcode is not None and str(errcode) in SESSION_EXPIRED_ERRCODES:
-            self._sessid = None
-            return None
-
-        return self._map_state(data, resp.status_code, text)
+        return UploadResult(
+            status=FAILED, http_status=resp.status_code,
+            response_text=text[:2000], error="non-JSON response",
+        )
 
     @staticmethod
     def _map_state(data, http_status: int, text: str) -> UploadResult:
-        state = _find_key(data, "state")
+        info = _sentdatainfo(data)
+        state = info.get("state")
+        if state is None:
+            state = _find_key(data, "state")
         state = str(state).lower() if state is not None else None
         response_text = text[:2000]
 
         if state in ("ok", "nt"):
-            er_count = _find_key(data, "er")
-            try:
-                er_count = int(er_count) if er_count is not None else 0
-            except (TypeError, ValueError):
-                er_count = 0
+            detail = _rejection_detail(info)
+            er_count = _counter(info, "er")
             if er_count > 0:
+                error = f"{er_count} component(s) rejected within accepted request"
                 return UploadResult(
                     status=REJECTED, state=state, http_status=http_status,
                     response_text=response_text,
-                    error=f"{er_count} component(s) rejected within accepted request",
+                    error=f"{error}: {detail}" if detail else error,
                 )
+            # ig = component dropped but the package was accepted: the subject
+            # is stored partially -> sent, but surfaced as a warning (alert).
+            has_warnings = state == "nt" or _counter(info, "ig") > 0
             return UploadResult(
                 status=SENT, state=state, http_status=http_status,
-                response_text=response_text, has_warnings=(state == "nt"),
+                response_text=response_text, has_warnings=has_warnings,
             )
         if state == "er":
+            detail = _rejection_detail(info)
+            error = "rejected by UBKI (state=er)"
             return UploadResult(
                 status=REJECTED, state=state, http_status=http_status,
-                response_text=response_text, error="rejected by UBKI (state=er)",
+                response_text=response_text,
+                error=f"{error}: {detail}" if detail else error,
             )
         if state == "sy":
+            # SYSTEM errors: the wiki asks clients to back off while they
+            # last, so count them toward the 3-strike pass abort.
             return UploadResult(
                 status=FAILED, state=state, http_status=http_status,
                 response_text=response_text, error="UBKI system error (state=sy)",
+                is_network_error=True,
             )
         return UploadResult(
             status=FAILED, state=state, http_status=http_status,

@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS runs (
     id               INTEGER PRIMARY KEY,
     started_at       TEXT NOT NULL,
     finished_at      TEXT,
-    status           TEXT NOT NULL,          -- success | error | dry_run
+    status           TEXT NOT NULL,          -- success | aborted | error
     files_seen       INTEGER NOT NULL DEFAULT 0,
     records_sent     INTEGER NOT NULL DEFAULT 0,
     records_failed   INTEGER NOT NULL DEFAULT 0,
@@ -113,7 +113,9 @@ def recompute_file_status(conn: sqlite3.Connection, file_id: int) -> str:
         "SELECT status, COUNT(*) AS n FROM records WHERE file_id = ? GROUP BY status", (file_id,)
     ).fetchall()
     statuses = {row["status"] for row in rows}
-    if statuses <= {SENT} and statuses:
+    # empty set (a file ingested with zero records) counts as sent: nothing
+    # to transmit means the file is trivially complete and can be archived
+    if statuses <= {SENT}:
         status = SENT
     elif statuses == {PENDING}:
         status = PENDING
@@ -198,6 +200,10 @@ def insert_run(conn: sqlite3.Connection, started_at: str, status: str, summary: 
         ),
     )
     conn.commit()
+
+
+def recent_runs(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
 def last_successful_run(conn: sqlite3.Connection) -> str | None:

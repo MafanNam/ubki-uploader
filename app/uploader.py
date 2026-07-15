@@ -10,6 +10,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
+from fnmatch import fnmatch
 from pathlib import Path
 from sqlite3 import Connection
 
@@ -17,7 +18,7 @@ from . import db
 from .alerts import send_telegram
 from .config import Config
 from .db import FAILED, REJECTED, SENT, utcnow
-from .ubki_client import UbkiClient, kyiv_today
+from .ubki_client import UbkiClient, build_envelope, kyiv_today
 
 log = logging.getLogger("ubki.uploader")
 
@@ -68,25 +69,34 @@ def sha256_of(path: Path) -> str:
 
 
 def scan_folder(config: Config) -> list[Path]:
-    """Plain files in the data folder older than min_file_age_sec (a guard
-    against half-written files). archive/ and hidden files are ignored."""
+    """Files matching file_glob in the data folder, older than min_file_age_sec
+    (a guard against half-written files). archive/ and hidden files are ignored;
+    anything else outside the glob is logged, never sent."""
     if not config.data_folder.is_dir():
         raise FileNotFoundError(f"data folder not accessible: {config.data_folder}")
     cutoff = time.time() - config.min_file_age_sec
-    eligible = [
-        path
-        for path in sorted(config.data_folder.iterdir())
-        if path.is_file() and not path.name.startswith(".") and path.stat().st_mtime <= cutoff
-    ]
+    eligible = []
+    for path in sorted(config.data_folder.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if not fnmatch(path.name, config.file_glob):
+            log.info(
+                "file ignored: name does not match FILE_GLOB",
+                extra={"event": "file_skipped_pattern", "file": path.name,
+                       "glob": config.file_glob},
+            )
+            continue
+        if path.stat().st_mtime <= cutoff:
+            eligible.append(path)
     return eligible
 
 
 def read_lines(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8") as fh:
-        return [line.rstrip("\n") for line in fh if line.strip()]
+        return [line.rstrip("\r\n") for line in fh if line.strip()]
 
 
-def ingest_new_files(conn: Connection, config: Config, paths: list[Path], summary: RunSummary, dry_run: bool) -> None:
+def ingest_new_files(conn: Connection, paths: list[Path], summary: RunSummary, dry_run: bool) -> None:
     for path in paths:
         sha = sha256_of(path)
         if db.get_file_by_identity(conn, path.name, sha):
@@ -111,10 +121,11 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
     consecutive_network_errors = 0
     for record in records:
         raw_line = record["raw_line"]
-        if len(raw_line.encode("utf-8")) > config.max_line_bytes:
+        # UBKI's 2MB limit applies to the whole request, envelope included
+        if len(build_envelope(raw_line, record["uuid"])) > config.max_line_bytes:
             db.update_record_result(
                 conn, record["id"], REJECTED,
-                last_error=f"line exceeds {config.max_line_bytes} bytes, not sent",
+                last_error=f"request envelope exceeds {config.max_line_bytes} bytes, not sent",
             )
             summary.records_rejected += 1
             continue
@@ -190,7 +201,7 @@ def build_alert(summary: RunSummary) -> str | None:
     if summary.records_rejected:
         lines.append(f"rejected: {summary.records_rejected} (потрібен ручний розбір)")
     if summary.records_warnings:
-        lines.append(f"прийнято з зауваженнями (nt): {summary.records_warnings}")
+        lines.append(f"прийнято з зауваженнями (nt/ig): {summary.records_warnings}")
     lines.extend(summary.errors)
     lines.append(f"sent: {summary.records_sent}")
     return "\n".join(lines)
@@ -220,7 +231,7 @@ def _run_locked(config: Config, client: UbkiClient | None, summary: RunSummary) 
             "pass started",
             extra={"event": "pass_start", "files_seen": len(paths), "dry_run": summary.dry_run},
         )
-        ingest_new_files(conn, config, paths, summary, summary.dry_run)
+        ingest_new_files(conn, paths, summary, summary.dry_run)
         if summary.dry_run:
             pending = conn.execute(
                 "SELECT COUNT(*) AS n FROM records WHERE status = 'pending'"
@@ -235,11 +246,15 @@ def _run_locked(config: Config, client: UbkiClient | None, summary: RunSummary) 
             client = UbkiClient(config, session_store=DbSessionStore(conn))
         send_records(conn, config, client, summary)
 
-        for row in conn.execute("SELECT DISTINCT file_id FROM records").fetchall():
-            db.recompute_file_status(conn, row["file_id"])
+        # over files, not records: covers files ingested with zero records
+        for row in conn.execute("SELECT id FROM files WHERE archived_at IS NULL").fetchall():
+            db.recompute_file_status(conn, row["id"])
         archive_completed_files(conn, config, summary)
 
-        db.insert_run(conn, started_at, "success", summary.as_dict())
+        # an aborted pass must not advance last_successful_run (health 25h rule)
+        run_status = "aborted" if summary.aborted else "success"
+        db.insert_run(conn, started_at, run_status, summary.as_dict(),
+                      error="; ".join(summary.errors) or None)
         log.info("pass finished", extra={"event": "pass_done", **summary.as_dict()})
     except Exception as exc:
         summary.errors.append(str(exc))

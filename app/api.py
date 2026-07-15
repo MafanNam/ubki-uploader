@@ -15,11 +15,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from . import db
 from .config import Config, load_config
+from .jsonlog import setup_logging
 
 STALE_RUN_AFTER = timedelta(hours=25)
 
 
 def create_app(config: Config | None = None) -> FastAPI:
+    setup_logging()  # same structured JSON logs as the scheduler passes
     config = config or load_config()
     app = FastAPI(title="ubki-uploader")
 
@@ -47,7 +49,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         else:
             age = datetime.now(timezone.utc) - datetime.fromisoformat(last_run)
             if age > STALE_RUN_AFTER:
-                reasons.append(f"last successful run is {age} old (> 25h)")
+                reasons.append(
+                    f"last successful run is {age.total_seconds() / 3600:.1f}h old (> 25h)"
+                )
 
         failed_over_cap = conn.execute(
             "SELECT COUNT(*) AS n FROM records WHERE status = ? AND attempts >= ?",
@@ -74,6 +78,13 @@ def create_app(config: Config | None = None) -> FastAPI:
             "last_sent_at": db.last_sent_at(conn),
             "record_counts": counts,
         }
+
+    @app.get("/runs")
+    def list_runs(
+        limit: int = Query(default=20, ge=1, le=200),
+        conn=Depends(get_conn),
+    ):
+        return {"runs": [dict(row) for row in db.recent_runs(conn, limit)]}
 
     @app.get("/files")
     def list_files(
