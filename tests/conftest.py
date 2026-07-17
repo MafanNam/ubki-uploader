@@ -27,6 +27,8 @@ def _info_logging(caplog):
 def cfg(tmp_path: Path) -> Config:
     data_folder = tmp_path / "inbox"
     data_folder.mkdir()
+    raw_folder = tmp_path / "raw"
+    raw_folder.mkdir()
     return Config(
         data_folder=data_folder,
         ubki_login="login",
@@ -37,6 +39,7 @@ def cfg(tmp_path: Path) -> Config:
         api_token="secret-token",
         min_file_age_sec=300,
         file_glob="*.jsonl",  # prod default is *.txt; tests use .jsonl names
+        raw_folder=raw_folder,
     )
 
 
