@@ -4,7 +4,10 @@ import json
 from datetime import date, datetime
 
 from app import db
-from app.enricher import EnrichSummary, build_alert, enrich_line, normalize_phone, run_enrich
+from app.enricher import (
+    EnrichSummary, _write_enriched, build_alert, enrich_line, normalize_phone,
+    run_enrich, unwrap_quarantine,
+)
 
 from .conftest import write_jsonl
 
@@ -274,3 +277,117 @@ def test_quarantine_file_roundtrips_back_through_raw(cfg):
 
 def test_alert_none_when_clean():
     assert build_alert(EnrichSummary(lines_enriched=5)) is None
+
+
+# --- calendar-invalid dates (must not crash the whole run) --------------------
+
+def test_id_card_zero_date_string_quarantines_not_crashes(cfg):
+    # MySQL zero-date returned as a string: regex-valid but not a real date.
+    # Must quarantine gracefully, not raise from _plus_years and abort the batch.
+    row = make_row(snap_passport_number="123456789", snap_passport_date="0000-00-00",
+                   user_passport_number=None)
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
+    assert subject is None
+    assert "dterm" in reason
+
+
+def test_invalid_string_date_omitted_not_sent_as_garbage(cfg):
+    # A calendar-invalid string passport date is dropped, not shipped as dwdt.
+    row = make_row(snap_passport_date="2021-02-30")
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
+    assert reason is None
+    assert "dwdt" not in subject["docs"][0]
+
+
+# --- newest-application selection keeps time resolution -----------------------
+
+def test_same_day_applications_pick_latest_by_time(cfg):
+    line = make_line(deals=[{"dlref": "1"}, {"dlref": "2"}])
+    rows = {
+        "1": make_row(app_id=1, applied_at=datetime(2026, 2, 2, 9, 0), snap_phone="0671112233"),
+        "2": make_row(app_id=2, applied_at=datetime(2026, 2, 2, 18, 0), snap_phone="0679998877"),
+    }
+    subject, reason = enrich_line(line, rows, cfg)
+    assert reason is None
+    assert subject["contacts"][0]["cval"] == "+380679998877"  # 18:00 beats 9:00, same day
+
+
+# --- empty / skipped files surface in the alert -------------------------------
+
+def test_empty_raw_file_flagged_and_alerted(cfg):
+    write_jsonl(cfg.raw_folder, "empty.jsonl", [])
+    summary = run_enrich(cfg, fetch=fake_fetch({}))
+    assert summary.files_empty == 1
+    assert summary.lines_total == 0
+    assert not (cfg.data_folder / "empty.jsonl").exists()
+    alert = build_alert(summary)
+    assert alert is not None and "порожніх" in alert
+
+
+def test_non_glob_file_surfaces_in_alert(cfg):
+    write_jsonl(cfg.raw_folder, "report.csv", ["a,b,c"])  # outside *.jsonl
+    summary = run_enrich(cfg, fetch=fake_fetch({}))
+    assert summary.files_skipped == 1
+    assert summary.files_processed == 0
+    alert = build_alert(summary)
+    assert alert is not None and "FILE_GLOB" in alert
+
+
+# --- duplicate-submission guard on crash re-processing ------------------------
+
+def test_write_enriched_reuses_identical_file(cfg):
+    lines = ['{"a":1}']
+    t1 = _write_enriched(cfg.data_folder, "x.jsonl", "aabbccdd", lines)
+    t2 = _write_enriched(cfg.data_folder, "x.jsonl", "aabbccdd", lines)  # crash retry
+    assert t1 == t2
+    assert [p.name for p in cfg.data_folder.iterdir() if p.is_file()] == ["x.jsonl"]
+
+
+def test_write_enriched_preserves_different_file(cfg):
+    _write_enriched(cfg.data_folder, "x.jsonl", "aabbccdd", ['{"a":1}'])
+    _write_enriched(cfg.data_folder, "x.jsonl", "11223344", ['{"a":2}'])  # different content
+    names = sorted(p.name for p in cfg.data_folder.iterdir() if p.is_file())
+    assert names == ["11223344_x.jsonl", "x.jsonl"]
+
+
+# --- quarantine line numbers are true file lines ------------------------------
+
+def test_quarantine_line_no_is_true_file_line(cfg):
+    good = json.dumps(make_line(), ensure_ascii=False)
+    write_jsonl(cfg.raw_folder, "a.jsonl", ["", good, "", "{broken"])
+    run_enrich(cfg, fetch=fake_fetch({"395397": make_row()}))
+    q = [json.loads(l) for l in
+         (cfg.quarantine_folder / "a.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [rec["line_no"] for rec in q] == [4]  # true file line, not the 2nd non-blank
+
+
+# --- unwrap_quarantine requires an exact key set ------------------------------
+
+def test_unwrap_quarantine_requires_exact_keys():
+    rec = {"line_no": 1, "reason": "x", "line": '{"inn":"1"}'}
+    assert unwrap_quarantine(rec) == {"inn": "1"}
+    # a real subject that merely happens to carry those keys is left untouched
+    subj = {"inn": "1", "line_no": 1, "reason": "x", "line": "y", "deals": []}
+    assert unwrap_quarantine(subj) is subj
+
+
+# --- one bad file must not abort the whole batch ------------------------------
+
+def test_one_bad_file_does_not_abort_batch(cfg):
+    write_jsonl(cfg.raw_folder, "a_good.jsonl", [json.dumps(make_line(), ensure_ascii=False)])
+    write_jsonl(cfg.raw_folder, "z_bad.jsonl", [json.dumps(make_line(), ensure_ascii=False)])
+
+    calls = {"n": 0}
+
+    def flaky_fetch(config, dlrefs):
+        calls["n"] += 1
+        if calls["n"] == 2:  # blow up on the second file (sorted order)
+            raise RuntimeError("cabinet DB exploded")
+        return {"395397": make_row()}
+
+    summary = run_enrich(cfg, fetch=flaky_fetch)
+    assert (cfg.data_folder / "a_good.jsonl").exists()  # good file still enriched
+    assert summary.lines_enriched == 1
+    assert any("z_bad.jsonl" in e for e in summary.errors)
+    alert = build_alert(summary)
+    assert alert is not None and "z_bad.jsonl" in alert

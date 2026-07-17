@@ -41,7 +41,7 @@ from typing import Callable
 from . import db
 from .alerts import send_telegram
 from .config import Config
-from .uploader import read_lines, scan_folder, sha256_of
+from .uploader import scan_folder, sha256_of
 
 log = logging.getLogger("ubki.enricher")
 
@@ -82,6 +82,7 @@ class EnrichSummary:
     files_seen: int = 0
     files_processed: int = 0
     files_skipped: int = 0  # outside FILE_GLOB (filled by scan_folder)
+    files_empty: int = 0    # raw files with zero data lines (truncated export)
     lines_total: int = 0
     lines_enriched: int = 0
     lines_quarantined: int = 0
@@ -129,8 +130,10 @@ def normalize_phone(value) -> str | None:
 
 
 def _iso_date(value) -> str | None:
-    """MySQL drivers return date/datetime objects; quarantine formats we
-    don't recognize rather than sending garbage."""
+    """MySQL drivers return date/datetime objects; quarantine formats we don't
+    recognize — including calendar-invalid strings like MySQL's zero-date
+    '0000-00-00' or '2021-02-30' — rather than sending garbage or letting them
+    reach _plus_years, where date.fromisoformat would raise and abort the run."""
     if value is None or value == "":
         return None
     if hasattr(value, "date"):  # datetime
@@ -138,7 +141,24 @@ def _iso_date(value) -> str | None:
     if hasattr(value, "isoformat"):
         return value.isoformat()
     text = str(value).strip()
-    return text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
+def _sort_key(value) -> str:
+    """Full-resolution key for picking the NEWEST application. Unlike _iso_date
+    (date-only), this keeps the time component so two same-day applications
+    don't tie and silently fall back to the line's deal order. ISO strings sort
+    chronologically; a missing value sorts first (oldest)."""
+    if value is None or value == "":
+        return ""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value).strip()
 
 
 def _plus_years(iso_day: str, years: int) -> str:
@@ -208,7 +228,7 @@ def build_addr(row: dict, vdate: str) -> dict:
 
 def unwrap_quarantine(obj):
     """A re-dropped quarantine record carries the original line under `line`."""
-    if isinstance(obj, dict) and _QUARANTINE_KEYS <= set(obj.keys()):
+    if isinstance(obj, dict) and set(obj.keys()) == _QUARANTINE_KEYS:
         inner = obj["line"]
         if isinstance(inner, str):
             return json.loads(inner)
@@ -239,8 +259,8 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config) -> tuple[
     if len(user_ids) > 1:
         return None, f"deals belong to different clients: user_ids={sorted(user_ids)}"
 
-    # ISO strings sort chronologically; missing applied_at sorts first
-    newest = max(deal_rows, key=lambda row: _iso_date(row.get("applied_at")) or "")
+    # full-resolution ordering so same-day applications don't tie (see _sort_key)
+    newest = max(deal_rows, key=lambda row: _sort_key(row.get("applied_at")))
     user_inn = str(newest.get("user_inn") or "").strip()
     if user_inn != inn:
         return None, f"inn mismatch: file has {inn}, cabinet client has different inn"
@@ -304,23 +324,58 @@ def _unique_target(folder: Path, name: str, sha256: str) -> Path:
     return target
 
 
+def _read_numbered_lines(path: Path) -> list[tuple[int, str]]:
+    """Non-blank lines paired with their TRUE 1-based line number in the file,
+    so a quarantine record points the operator at the right line even when the
+    raw file has blank lines (read_lines drops blanks and loses the mapping)."""
+    with path.open("r", encoding="utf-8") as fh:
+        return [(n, line.rstrip("\r\n"))
+                for n, line in enumerate(fh, start=1) if line.strip()]
+
+
+def _write_enriched(folder: Path, name: str, sha256: str, lines: list[str]) -> Path:
+    """Atomically write the enriched inbox file. The raw->enriched transform is
+    deterministic, so a byte-identical file already under this name is a prior
+    crashed attempt for the same raw (killed between the write and the
+    idempotency-row commit) — reuse it instead of emitting a second same-content
+    file under a prefixed name, which the uploader would ingest as a distinct
+    identity and send to UBKI twice. A DIFFERENT file already holding the name
+    (an earlier, still-unconsumed enriched file) is preserved via the sha prefix."""
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    target = folder / name
+    if target.exists() and target.read_bytes() != data:
+        target = folder / f"{sha256[:8]}_{name}"
+    if target.exists() and target.read_bytes() == data:
+        return target
+    tmp = target.with_name(f".{target.name}.tmp")  # hidden: invisible to the uploader scan
+    tmp.write_bytes(data)
+    tmp.rename(target)
+    return target
+
+
 def process_file(conn: Connection, config: Config, path: Path,
                  summary: EnrichSummary, fetch: Fetcher, dry_run: bool) -> None:
     sha = sha256_of(path)
     if db.get_enriched_by_identity(conn, path.name, sha):
         return  # already enriched (identity = filename + sha256)
 
-    raw_lines = read_lines(path)
+    numbered = _read_numbered_lines(path)
     summary.files_processed += 1
-    summary.lines_total += len(raw_lines)
+    summary.lines_total += len(numbered)
     log.info("raw file discovered", extra={
-        "event": "raw_file_new", "file": path.name, "sha256": sha, "lines": len(raw_lines)})
+        "event": "raw_file_new", "file": path.name, "sha256": sha, "lines": len(numbered)})
+    if not numbered:
+        # truncated/blank producer export: no enriched output would ever reach
+        # the uploader, so surface it here or it vanishes silently
+        summary.files_empty += 1
+        log.warning("raw file has no data lines", extra={
+            "event": "raw_file_empty", "file": path.name, "sha256": sha})
     if dry_run:
         return
 
     parsed: list[tuple[int, str, dict | None, str | None]] = []
     dlrefs: set[str] = set()
-    for line_no, raw in enumerate(raw_lines, start=1):
+    for line_no, raw in numbered:
         try:
             obj = unwrap_quarantine(json.loads(raw))
         except ValueError as exc:
@@ -352,10 +407,7 @@ def process_file(conn: Connection, config: Config, path: Path,
 
     if enriched:
         config.data_folder.mkdir(parents=True, exist_ok=True)
-        target = _unique_target(config.data_folder, path.name, sha)
-        tmp = target.with_name(f".{target.name}.tmp")  # hidden: invisible to the uploader scan
-        tmp.write_text("\n".join(enriched) + "\n", encoding="utf-8")
-        tmp.rename(target)
+        target = _write_enriched(config.data_folder, path.name, sha, enriched)
         # atomic rename means the file can never be seen half-written, so the
         # uploader's mtime freshness guard is pointless here — backdate it so
         # a manual enrich -> run_once chain works without waiting
@@ -380,7 +432,7 @@ def process_file(conn: Connection, config: Config, path: Path,
     config.processed_folder.mkdir(parents=True, exist_ok=True)
     path.rename(_unique_target(config.processed_folder, path.name, sha))
 
-    db.insert_enriched_file(conn, path.name, sha, len(raw_lines), len(enriched), len(quarantined))
+    db.insert_enriched_file(conn, path.name, sha, len(numbered), len(enriched), len(quarantined))
     summary.lines_enriched += len(enriched)
     summary.lines_quarantined += len(quarantined)
     summary.quarantine_reasons.extend(
@@ -388,7 +440,8 @@ def process_file(conn: Connection, config: Config, path: Path,
 
 
 def build_alert(summary: EnrichSummary) -> str | None:
-    if not (summary.lines_quarantined or summary.errors):
+    if not (summary.lines_quarantined or summary.files_skipped
+            or summary.files_empty or summary.errors):
         return None
     lines = ["UBKI enricher: проблеми при збагаченні"]
     if summary.lines_quarantined:
@@ -396,6 +449,10 @@ def build_alert(summary: EnrichSummary) -> str | None:
         lines.extend(summary.quarantine_reasons[:5])
         if len(summary.quarantine_reasons) > 5:
             lines.append(f"… та ще {len(summary.quarantine_reasons) - 5}")
+    if summary.files_skipped:
+        lines.append(f"файлів у папці поза маскою FILE_GLOB: {summary.files_skipped}")
+    if summary.files_empty:
+        lines.append(f"порожніх raw-файлів (0 рядків даних): {summary.files_empty}")
     lines.extend(summary.errors)
     lines.append(f"збагачено: {summary.lines_enriched}")
     return "\n".join(lines)
@@ -424,7 +481,15 @@ def run_enrich(config: Config, fetch: Fetcher | None = None, dry_run: bool = Fal
             log.info("enrich started", extra={
                 "event": "enrich_start", "files_seen": len(paths), "dry_run": dry_run})
             for path in paths:
-                process_file(conn, config, path, summary, fetch, dry_run)
+                try:
+                    process_file(conn, config, path, summary, fetch, dry_run)
+                except Exception as exc:
+                    # one bad file must not abort the whole batch; record it and
+                    # move on so the rest of the day's files still get enriched
+                    # (they are retried next run — partial state is idempotent)
+                    summary.errors.append(f"{path.name}: {exc}")
+                    log.exception("file enrichment failed", extra={
+                        "event": "enrich_file_error", "file": path.name})
             log.info("enrich finished", extra={"event": "enrich_done", **summary.as_dict()})
         except Exception as exc:
             summary.errors.append(str(exc))
