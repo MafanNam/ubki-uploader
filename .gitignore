@@ -4,6 +4,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
+.env.copy
+.env.dev
+.env.prod
 data/
 
 ubki-data/**
