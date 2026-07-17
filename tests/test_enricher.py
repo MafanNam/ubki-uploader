@@ -83,12 +83,23 @@ def test_enrich_line_builds_full_subject(cfg):
     assert deal["deallife"] == [{"dlmonth": 7, "dlyear": 2026, "dlflstat": 1}]
 
 
-def test_id_card_is_dtype_17(cfg):
+def test_id_card_is_dtype_17_with_derived_dterm(cfg):
     row = make_row(snap_passport_number="123456789")
     subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
     assert reason is None
     doc = subject["docs"][0]
     assert (doc["dtype"], doc["dser"], doc["dnom"]) == ("17", "", "123456789")
+    # bureau requires dterm for ID cards (live 3003); derived as issue + 10y
+    assert doc["dwdt"] == "2014-10-01"
+    assert doc["dterm"] == "2024-10-01"
+
+
+def test_id_card_without_issue_date_quarantines(cfg):
+    row = make_row(snap_passport_number="123456789", snap_passport_date=None,
+                   user_passport_number=None)
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
+    assert subject is None
+    assert "dterm" in reason
 
 
 def test_passport_falls_back_to_users_row(cfg):
@@ -122,11 +133,13 @@ def test_issuer_fallback_to_users_doc(cfg):
     # snapshot has a valid number but no issuer; users has a complete doc
     row = make_row(snap_passport_issued_by="",
                    user_passport_number="123456789",
-                   user_passport_issued_by="8888")
+                   user_passport_issued_by="8888",
+                   user_passport_date=date(2020, 2, 29))
     subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
     assert reason is None
     doc = subject["docs"][0]
     assert (doc["dtype"], doc["dnom"], doc["dwho"]) == ("17", "123456789", "8888")
+    assert doc["dterm"] == "2030-02-28"  # leap-day issue date handled
 
 
 def test_inn_mismatch_quarantines(cfg):

@@ -33,6 +33,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Callable
@@ -140,14 +141,24 @@ def _iso_date(value) -> str | None:
     return text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else None
 
 
+def _plus_years(iso_day: str, years: int) -> str:
+    day = date.fromisoformat(iso_day)
+    try:
+        return day.replace(year=day.year + years).isoformat()
+    except ValueError:  # Feb 29 -> Feb 28
+        return day.replace(year=day.year + years, day=28).isoformat()
+
+
 def build_doc(row: dict, vdate: str) -> tuple[dict | None, str | None]:
     """docs[0] from the application snapshot, falling back to users.
     Format detection: 2 letters + 6 digits = passport book (dtype 1),
-    9 digits = ID card (dtype 17, sent without eddr_number in v1).
-    `dwho` (issuer) is de-facto mandatory — confirmed live: a doc without it
-    is dropped by the bureau (IGNORED 3003) which then rejects the whole
-    package (CRITICAL 2077), so such lines are quarantined instead."""
+    9 digits = ID card (dtype 17, sent without eddr_number — the bureau never
+    asked for it live). De-facto mandatory (live-confirmed IGNORED 3003 →
+    CRITICAL 2077): `dwho` for every doc, `dterm` for ID cards. The cabinet
+    has no expiry field, so dterm is derived as issue date + 10 years (the
+    statutory adult ID-card validity)."""
     saw_valid_number = False
+    saw_idcard_without_date = False
     for prefix in ("snap", "user"):
         number = re.sub(r"\s+", "", str(row.get(f"{prefix}_passport_number") or "")).upper()
         if not number:
@@ -163,12 +174,19 @@ def build_doc(row: dict, vdate: str) -> tuple[dict | None, str | None]:
         issued_by = str(row.get(f"{prefix}_passport_issued_by") or "").strip()
         if not issued_by:
             continue  # bureau drops docs without an issuer; try the other source
+        issued_at = _iso_date(row.get(f"{prefix}_passport_date"))
+        if dtype == DOC_TYPE_ID_CARD and not issued_at:
+            saw_idcard_without_date = True
+            continue  # dterm cannot be derived without the issue date
         doc = {"vdate": vdate, "lng": LANG_UKRAINIAN, "dtype": dtype, "dser": dser,
                "dnom": dnom, "dwho": issued_by}
-        issued_at = _iso_date(row.get(f"{prefix}_passport_date"))
         if issued_at:
             doc["dwdt"] = issued_at
+        if dtype == DOC_TYPE_ID_CARD:
+            doc["dterm"] = _plus_years(issued_at, 10)
         return doc, None
+    if saw_idcard_without_date:
+        return None, "ID-card has no issue date in the cabinet — dterm cannot be derived"
     if saw_valid_number:
         return None, "document issuer (dwho) is empty in the cabinet (bureau drops such docs, 3003)"
     return None, "unsupported passport format (neither 2 letters + 6 digits nor 9 digits)"
