@@ -47,6 +47,8 @@ class RunSummary:
     dry_run: bool = False
     files_seen: int = 0
     files_new: int = 0
+    files_skipped: int = 0  # present in the folder but outside FILE_GLOB
+    files_empty: int = 0    # ingested with zero non-blank lines
     records_sent: int = 0
     records_failed: int = 0
     records_rejected: int = 0
@@ -68,10 +70,11 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def scan_folder(config: Config) -> list[Path]:
+def scan_folder(config: Config, summary: RunSummary | None = None) -> list[Path]:
     """Files matching file_glob in the data folder, older than min_file_age_sec
     (a guard against half-written files). archive/ and hidden files are ignored;
-    anything else outside the glob is logged, never sent."""
+    anything else outside the glob is logged, counted in the summary (so it
+    reaches the alert) and never sent."""
     if not config.data_folder.is_dir():
         raise FileNotFoundError(f"data folder not accessible: {config.data_folder}")
     cutoff = time.time() - config.min_file_age_sec
@@ -80,11 +83,13 @@ def scan_folder(config: Config) -> list[Path]:
         if not path.is_file() or path.name.startswith("."):
             continue
         if not fnmatch(path.name, config.file_glob):
-            log.info(
+            log.warning(
                 "file ignored: name does not match FILE_GLOB",
                 extra={"event": "file_skipped_pattern", "file": path.name,
                        "glob": config.file_glob},
             )
+            if summary is not None:
+                summary.files_skipped += 1
             continue
         if path.stat().st_mtime <= cutoff:
             eligible.append(path)
@@ -107,6 +112,14 @@ def ingest_new_files(conn: Connection, paths: list[Path], summary: RunSummary, d
             extra={"event": "file_new", "file": path.name, "sha256": sha, "lines": len(lines)},
         )
         summary.files_new += 1
+        if not lines:
+            # likely a truncated/blank producer export — completes as `sent`
+            # (nothing to transmit) but must not pass unnoticed
+            log.warning(
+                "file has no data lines",
+                extra={"event": "file_empty", "file": path.name, "sha256": sha},
+            )
+            summary.files_empty += 1
         if dry_run:
             continue
         db.insert_file(conn, path.name, sha, path.stat().st_size, lines)
@@ -131,9 +144,13 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
             continue
 
         result = client.upload_record(raw_line, record["uuid"])
+        # network-like failures don't burn attempts: retry_cap guards against
+        # permanently-bad records, not against UBKI/transport outages (an
+        # outage must never exhaust a record's auto-retries)
         db.update_record_result(
             conn, record["id"], result.status,
             last_error=result.error, ubki_response=result.response_text,
+            count_attempt=not result.is_network_error,
         )
         log.info(
             "record processed",
@@ -157,9 +174,13 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
             if consecutive_network_errors >= config.network_abort_threshold:
                 summary.aborted = True
                 summary.errors.append(
-                    f"aborted after {consecutive_network_errors} consecutive network errors"
+                    f"aborted after {consecutive_network_errors} consecutive"
+                    " network-like errors (transport/5xx/sy/session)"
                 )
-                log.error("pass aborted: UBKI unreachable", extra={"event": "abort_network"})
+                log.error(
+                    "pass aborted: UBKI unreachable or erroring",
+                    extra={"event": "abort_network", "last_error": result.error},
+                )
                 return
         else:
             consecutive_network_errors = 0
@@ -193,7 +214,8 @@ def archive_completed_files(conn: Connection, config: Config, summary: RunSummar
 
 
 def build_alert(summary: RunSummary) -> str | None:
-    if not (summary.records_failed or summary.records_rejected or summary.records_warnings or summary.errors):
+    if not (summary.records_failed or summary.records_rejected or summary.records_warnings
+            or summary.files_skipped or summary.files_empty or summary.errors):
         return None
     lines = ["UBKI uploader: проблеми за останній прохід"]
     if summary.records_failed:
@@ -202,6 +224,10 @@ def build_alert(summary: RunSummary) -> str | None:
         lines.append(f"rejected: {summary.records_rejected} (потрібен ручний розбір)")
     if summary.records_warnings:
         lines.append(f"прийнято з зауваженнями (nt/ig): {summary.records_warnings}")
+    if summary.files_skipped:
+        lines.append(f"файлів у папці поза маскою FILE_GLOB: {summary.files_skipped}")
+    if summary.files_empty:
+        lines.append(f"порожніх файлів (0 рядків даних): {summary.files_empty}")
     lines.extend(summary.errors)
     lines.append(f"sent: {summary.records_sent}")
     return "\n".join(lines)
@@ -225,7 +251,7 @@ def _run_locked(config: Config, client: UbkiClient | None, summary: RunSummary) 
     conn = db.connect(config.db_path)
     own_client = client is None
     try:
-        paths = scan_folder(config)
+        paths = scan_folder(config, summary)
         summary.files_seen = len(paths)
         log.info(
             "pass started",
@@ -246,8 +272,9 @@ def _run_locked(config: Config, client: UbkiClient | None, summary: RunSummary) 
             client = UbkiClient(config, session_store=DbSessionStore(conn))
         send_records(conn, config, client, summary)
 
-        # over files, not records: covers files ingested with zero records
-        for row in conn.execute("SELECT id FROM files WHERE archived_at IS NULL").fetchall():
+        # over ALL files, not records: covers files ingested with zero records
+        # AND archived files whose records were manually retried and re-sent
+        for row in conn.execute("SELECT id FROM files").fetchall():
             db.recompute_file_status(conn, row["id"])
         archive_completed_files(conn, config, summary)
 

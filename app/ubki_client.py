@@ -243,25 +243,29 @@ class UbkiClient:
             data = None
 
         if data is not None:
-            # Session errors surface as sentdatainfo.main_errcode (or a
-            # top-level errcode in flat variants). Per-component errcodes
-            # inside items[] must never trigger a re-auth.
             info = _sentdatainfo(data)
-            errcode = info.get("main_errcode")
-            if errcode is None and isinstance(data, dict):
-                errcode = data.get("errcode")
-            if errcode is not None and str(errcode) in SESSION_EXPIRED_ERRCODES:
-                self._sessid = None
-                return None
-            # A body carrying `state` is authoritative over the HTTP code:
-            # UBKI pairs validation rejections (state=er) with HTTP 400
-            # (observed live 2026-07-15), and those must map to `rejected`,
-            # not to a retryable HTTP failure.
+            if resp.status_code == 200:
+                # Session errors surface as sentdatainfo.main_errcode (or a
+                # top-level errcode in flat variants) on a 200 body; on any
+                # other status the HTTP code decides. Per-component errcodes
+                # inside items[] must never trigger a re-auth.
+                errcode = info.get("main_errcode")
+                if errcode is None and isinstance(data, dict):
+                    errcode = data.get("errcode")
+                if errcode is not None and str(errcode) in SESSION_EXPIRED_ERRCODES:
+                    self._sessid = None
+                    return None
+            # state and the counters are read from the same (shallow) `info`
+            # so a variant layout can't yield a state without its counters.
             state = info.get("state")
-            if state is None:
-                state = _find_key(data, "state")
-            if resp.status_code == 200 or state is not None:
-                return self._map_state(data, resp.status_code, text)
+            state = str(state).lower() if state is not None else None
+            # For client errors a body carrying `state` is authoritative over
+            # the HTTP code: UBKI pairs validation rejections (state=er) with
+            # HTTP 400 (observed live 2026-07-15). A 5xx always stays a
+            # transport failure — a gateway error page containing some
+            # "state" field must not defeat the network-abort logic.
+            if resp.status_code < 500 and (resp.status_code == 200 or state is not None):
+                return self._map_state(info, state, resp.status_code, text)
 
         if resp.status_code >= 500:
             return UploadResult(
@@ -280,27 +284,26 @@ class UbkiClient:
         )
 
     @staticmethod
-    def _map_state(data, http_status: int, text: str) -> UploadResult:
-        info = _sentdatainfo(data)
-        state = info.get("state")
-        if state is None:
-            state = _find_key(data, "state")
-        state = str(state).lower() if state is not None else None
+    def _map_state(info: dict, state: str | None, http_status: int, text: str) -> UploadResult:
         response_text = text[:RESPONSE_TEXT_LIMIT]
 
         if state in ("ok", "nt"):
-            detail = _rejection_detail(info)
             er_count = _counter(info, "er")
             if er_count > 0:
+                detail = _rejection_detail(info)
                 error = f"{er_count} component(s) rejected within accepted request"
                 return UploadResult(
                     status=REJECTED, state=state, http_status=http_status,
                     response_text=response_text,
                     error=f"{error}: {detail}" if detail else error,
                 )
-            # ig = component dropped but the package was accepted: the subject
-            # is stored partially -> sent, but surfaced as a warning (alert).
-            has_warnings = state == "nt" or _counter(info, "ig") > 0
+            # nt = component accepted with notices (seen live: state=ok with
+            # nt>0 when the test base substituted the INN), ig = component
+            # dropped but package accepted: both must reach the operator as
+            # warnings even when the overall state is "ok".
+            has_warnings = (
+                state == "nt" or _counter(info, "nt") > 0 or _counter(info, "ig") > 0
+            )
             return UploadResult(
                 status=SENT, state=state, http_status=http_status,
                 response_text=response_text, has_warnings=has_warnings,

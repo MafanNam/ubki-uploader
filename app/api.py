@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -33,7 +34,10 @@ def _maybe_json(text: str | None):
 
 
 def create_app(config: Config | None = None) -> FastAPI:
-    setup_logging()  # same structured JSON logs as the scheduler passes
+    # same structured JSON logs as the scheduler passes — but a factory must
+    # not stomp root handlers configured by the host (pytest, an embedder)
+    if not logging.getLogger().handlers:
+        setup_logging()
     config = config or load_config()
     app = FastAPI(title="ubki-uploader")
 

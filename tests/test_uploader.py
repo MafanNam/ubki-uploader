@@ -5,7 +5,7 @@ import pytest
 from app import db
 from app.db import FAILED, PENDING, REJECTED, SENT
 from app.ubki_client import UploadResult
-from app.uploader import run_pass
+from app.uploader import build_alert, run_pass
 
 from .conftest import (
     FakeClient,
@@ -77,9 +77,11 @@ def test_network_failure_keeps_file_for_retry(cfg):
 
 
 def test_failed_records_retried_next_pass_until_cap(cfg):
+    # a non-network failure (e.g. an unexpected 4xx) burns attempts up to the cap
+    http_failed = UploadResult(status=FAILED, http_status=404, error="HTTP 404")
     write_jsonl(cfg.data_folder, "a.jsonl", LINES[:1])
     for _ in range(cfg.retry_cap):
-        run_pass(cfg, client=FakeClient([network_failed_result()]))
+        run_pass(cfg, client=FakeClient([http_failed]))
 
     conn = db.connect(cfg.db_path)
     record = conn.execute("SELECT * FROM records").fetchone()
@@ -91,6 +93,25 @@ def test_failed_records_retried_next_pass_until_cap(cfg):
     client = FakeClient([sent_result()])
     run_pass(cfg, client=client)
     assert client.calls == []
+
+
+def test_network_failures_do_not_burn_attempts(cfg):
+    """retry_cap guards against bad records, not outages: a multi-day UBKI
+    outage must never push a record beyond auto-retry."""
+    write_jsonl(cfg.data_folder, "a.jsonl", LINES[:1])
+    for _ in range(cfg.retry_cap + 2):
+        run_pass(cfg, client=FakeClient([network_failed_result()]))
+
+    conn = db.connect(cfg.db_path)
+    record = conn.execute("SELECT * FROM records").fetchone()
+    conn.close()
+    assert record["status"] == FAILED
+    assert record["attempts"] == 0
+
+    # once UBKI recovers the record is still auto-retried
+    client = FakeClient([sent_result()])
+    summary = run_pass(cfg, client=client)
+    assert summary.records_sent == 1
 
 
 def test_abort_after_consecutive_network_errors(cfg):
@@ -123,7 +144,7 @@ def test_aborted_pass_is_not_a_successful_run(cfg):
     try:
         run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
         assert run["status"] == "aborted"
-        assert "consecutive network errors" in run["error"]
+        assert "consecutive network-like errors" in run["error"]
         # health's 25h rule must keep working through a UBKI outage
         assert db.last_successful_run(conn) is None
     finally:
@@ -153,6 +174,19 @@ def test_empty_file_marked_sent_and_archived(cfg):
     assert row["status"] == SENT
     assert row["archived_at"] is not None
     assert (cfg.archive_folder / "empty.jsonl").exists()
+
+
+def test_skipped_and_empty_files_surface_in_summary_and_alert(cfg):
+    write_jsonl(cfg.data_folder, "junk.csv", LINES[:1])     # outside the *.jsonl glob
+    write_jsonl(cfg.data_folder, "empty.jsonl", ["", " "])  # zero data lines
+    summary = run_pass(cfg, client=FakeClient([sent_result()]))
+
+    assert summary.files_skipped == 1
+    assert summary.files_empty == 1
+    alert = build_alert(summary)
+    assert alert is not None
+    assert "FILE_GLOB" in alert
+    assert "порожніх файлів" in alert
 
 
 def test_line_under_limit_but_envelope_over_is_rejected(cfg):
@@ -214,6 +248,10 @@ def test_manual_retry_resets_rejected_and_resends(cfg):
     summary = run_pass(cfg, client=FakeClient([sent_result()]))
     assert summary.records_sent == 1
     assert record_statuses(cfg) == [SENT]
+    # the archived file must be re-aggregated too, not left stale
+    row = file_row(cfg)
+    assert row["status"] == SENT
+    assert row["archived_at"] is not None
 
 
 def test_seeded_session_is_used_by_next_pass(cfg):

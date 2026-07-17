@@ -287,6 +287,57 @@ def test_sy_state_counts_as_network_error(cfg):
     assert result.is_network_error is True
 
 
+def test_5xx_with_state_like_body_is_network_failed(cfg):
+    """A gateway error page containing some 'state' field must stay a
+    transport failure (counts toward the pass abort), not map via the body."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return httpx.Response(502, json={"error": {"state": "unavailable"}})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == FAILED
+    assert result.is_network_error is True
+    assert result.http_status == 502
+
+
+def test_errcode_2014_on_5xx_is_transport_failure_not_reauth(cfg):
+    calls = {"auth": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            calls["auth"] += 1
+            return httpx.Response(200, json=AUTH_OK)
+        return httpx.Response(503, json={"sentdatainfo": {"main_errcode": 2014}})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == FAILED
+    assert result.is_network_error is True
+    assert calls["auth"] == 1  # no re-auth churn on transport errors
+
+
+def test_nt_counter_on_ok_state_sets_warning(cfg):
+    """Observed live: state=ok with nt:4 when the test base substituted the
+    INN — components accepted with notices must surface as warnings."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return upload_response({"sentdatainfo": {
+            "state": "ok", "main_errcode": 0, "ok": 4, "nt": 4, "ig": 0, "er": 0, "sy": 0,
+            "items": [{"errtype": "NOTICE", "errcode": 5009, "msg": "іпн змінено"}],
+        }})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == SENT
+    assert result.has_warnings is True
+
+
 def test_session_rejected_twice_is_network_error(cfg):
     """Persistent 401 on upload must count toward the pass abort (no per-record
     auth storm: UBKI forbids frequent re-auth)."""

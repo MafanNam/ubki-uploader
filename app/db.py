@@ -159,12 +159,15 @@ def update_record_result(
     *,
     last_error: str | None = None,
     ubki_response: str | None = None,
+    count_attempt: bool = True,
 ) -> None:
+    """count_attempt=False keeps `attempts` unchanged — used for network-like
+    failures so an outage can't push a record over retry_cap."""
     sent_at = utcnow() if status == SENT else None
     conn.execute(
-        "UPDATE records SET status = ?, attempts = attempts + 1, last_error = ?,"
+        "UPDATE records SET status = ?, attempts = attempts + ?, last_error = ?,"
         " ubki_response = ?, sent_at = ? WHERE id = ?",
-        (status, last_error, ubki_response, sent_at, record_id),
+        (status, int(count_attempt), last_error, ubki_response, sent_at, record_id),
     )
     conn.commit()
 
