@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS enriched_files (
+    id                INTEGER PRIMARY KEY,
+    filename          TEXT NOT NULL,
+    sha256            TEXT NOT NULL,
+    lines_total       INTEGER NOT NULL,
+    lines_enriched    INTEGER NOT NULL,
+    lines_quarantined INTEGER NOT NULL,
+    created_at        TEXT NOT NULL,
+    UNIQUE (filename, sha256)
+);
 """
 
 
@@ -183,6 +194,26 @@ def reset_records(conn: sqlite3.Connection, *, file_id: int | None = None, recor
     )
     conn.commit()
     return cur.rowcount
+
+
+# --- enriched files (enricher state; identity = filename + sha256) --------
+
+def get_enriched_by_identity(conn: sqlite3.Connection, filename: str, sha256: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM enriched_files WHERE filename = ? AND sha256 = ?", (filename, sha256)
+    ).fetchone()
+
+
+def insert_enriched_file(
+    conn: sqlite3.Connection, filename: str, sha256: str,
+    lines_total: int, lines_enriched: int, lines_quarantined: int,
+) -> None:
+    conn.execute(
+        "INSERT INTO enriched_files (filename, sha256, lines_total, lines_enriched,"
+        " lines_quarantined, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (filename, sha256, lines_total, lines_enriched, lines_quarantined, utcnow()),
+    )
+    conn.commit()
 
 
 # --- runs / meta ---------------------------------------------------------

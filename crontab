@@ -1,2 +1,4 @@
-# Daily UBKI upload pass at 06:00 Kyiv time (container TZ=Europe/Kyiv)
+# Daily UBKI pipeline, Kyiv time (container TZ=Europe/Kyiv):
+# 05:30 enrich raw producer files from the cabinet MySQL, 06:00 upload
+30 5 * * * python -m app.enrich
 0 6 * * * python -m app.run_once

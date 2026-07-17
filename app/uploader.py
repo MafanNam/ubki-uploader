@@ -70,16 +70,19 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def scan_folder(config: Config, summary: RunSummary | None = None) -> list[Path]:
-    """Files matching file_glob in the data folder, older than min_file_age_sec
-    (a guard against half-written files). archive/ and hidden files are ignored;
+def scan_folder(config: Config, summary=None, folder: Path | None = None) -> list[Path]:
+    """Files matching file_glob in the folder (default: the uploader inbox),
+    older than min_file_age_sec (a guard against half-written files).
+    Subfolders (archive/, enriched/, ...) and hidden files are ignored;
     anything else outside the glob is logged, counted in the summary (so it
-    reaches the alert) and never sent."""
-    if not config.data_folder.is_dir():
-        raise FileNotFoundError(f"data folder not accessible: {config.data_folder}")
+    reaches the alert) and never sent. `summary` only needs a `files_skipped`
+    attribute — the enricher passes its own summary object."""
+    folder = folder or config.data_folder
+    if not folder.is_dir():
+        raise FileNotFoundError(f"data folder not accessible: {folder}")
     cutoff = time.time() - config.min_file_age_sec
     eligible = []
-    for path in sorted(config.data_folder.iterdir()):
+    for path in sorted(folder.iterdir()):
         if not path.is_file() or path.name.startswith("."):
             continue
         if not fnmatch(path.name, config.file_glob):

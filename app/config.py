@@ -29,6 +29,14 @@ class Config:
     max_line_bytes: int = 2 * 1024 * 1024
     network_abort_threshold: int = 3
     http_timeout_sec: float = 60.0
+    # enricher: raw producer files + cabinet MySQL (required only by app.enrich)
+    raw_folder: Path | None = None
+    mysql_host: str | None = None
+    mysql_port: int = 3306
+    mysql_user: str | None = None
+    mysql_password: str | None = None
+    mysql_db: str | None = None
+    deal_vidobes: str = "90"  # dir.15 "no collateral" — injected when a deal lacks it
 
     @property
     def archive_folder(self) -> Path:
@@ -37,6 +45,20 @@ class Config:
     @property
     def lock_path(self) -> Path:
         return self.db_path.parent / "run.lock"
+
+    @property
+    def enrich_lock_path(self) -> Path:
+        return self.db_path.parent / "enrich.lock"
+
+    @property
+    def quarantine_folder(self) -> Path:
+        assert self.raw_folder is not None
+        return self.raw_folder / "quarantine"
+
+    @property
+    def processed_folder(self) -> Path:
+        assert self.raw_folder is not None
+        return self.raw_folder / "processed"
 
 
 def _require(name: str) -> str:
@@ -60,4 +82,11 @@ def load_config() -> Config:
         retry_cap=int(os.environ.get("RETRY_CAP", "5")),
         min_file_age_sec=int(os.environ.get("MIN_FILE_AGE_SEC", "300")),
         file_glob=os.environ.get("FILE_GLOB", "").strip() or "*.txt",
+        raw_folder=Path(raw) if (raw := os.environ.get("RAW_FOLDER", "").strip()) else None,
+        mysql_host=os.environ.get("MYSQL_HOST") or None,
+        mysql_port=int(os.environ.get("MYSQL_PORT", "3306")),
+        mysql_user=os.environ.get("MYSQL_USER") or None,
+        mysql_password=os.environ.get("MYSQL_PASSWORD") or None,
+        mysql_db=os.environ.get("MYSQL_DB") or None,
+        deal_vidobes=os.environ.get("DEAL_VIDOBES", "").strip() or "90",
     )
