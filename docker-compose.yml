@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
     # localhost only: access in prod via SSH tunnel
     ports:
-      - "127.0.0.1:8001:8000"
+      - "127.0.0.1:8002:8000"
     env_file: .env
     environment:
       RAW_FOLDER: /ubki-data
