@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this service does
 
-Daily push of credit data to UBKI (Ukrainian credit bureau). Data files (`.txt`, JSONL inside: the line is the bare subject object **without** a `{"fo_cki": …}` wrapper) land in `UBKI_DATA_FOLDER_PATH`; each non-empty line is one subject and is sent as **one HTTP request** to UBKI. Successfully processed files move to `archive/`; per-line state lives in SQLite so nothing is ever sent twice. A read-only FastAPI facade (localhost-only, SSH tunnel in prod) exposes statuses and manual retries.
+Daily push of credit data to UBKI (Ukrainian credit bureau), in two cron stages:
+
+1. **Enricher** (`python -m app.enrich`, 05:30 Kyiv): producer drops `.txt` JSONL files (only `inn`, name, `bdate`, `deals`) into `RAW_FOLDER`; the enricher joins the cabinet MySQL (`dlref` = `finplugs_creditup_applications.id`) and writes complete fo_cki subjects (idents/docs/addrs/contacts, `person_id`=users.id, `is_gone`="0", injected `dlvidobes`) into the uploader inbox. Un-enrichable lines go to `RAW_FOLDER/quarantine/<same name>` with reasons (drop the file back into raw to reprocess); consumed raw files go to `RAW_FOLDER/processed/`.
+2. **Uploader** (`python -m app.run_once`, 06:00 Kyiv): enriched files land in `UBKI_DATA_FOLDER_PATH` (`= RAW_FOLDER/enriched` in compose); each non-empty line is one subject sent as **one HTTP request** to UBKI. Successfully processed files move to `archive/`; per-line state lives in SQLite so nothing is ever sent twice.
+
+**Invariant boundary**: the enricher legitimately parses and rebuilds lines; the uploader must NEVER parse them (the line is embedded into the envelope byte-for-byte, without a `{"fo_cki": …}` wrapper — the enricher writes the bare subject object). A read-only FastAPI facade (localhost-only, SSH tunnel in prod) exposes statuses and manual retries.
 
 ## Commands
 
@@ -15,6 +20,8 @@ Daily push of credit data to UBKI (Ukrainian credit bureau). Data files (`.txt`,
 
 python -m app.run_once --dry-run    # scan + report, zero DB writes, no sending
 python -m app.run_once              # one real pass (needs env vars, see .env.example)
+python -m app.enrich --dry-run      # scan raw folder + report, no MySQL, no writes
+python -m app.enrich                # enrich raw files (needs RAW_FOLDER + MYSQL_* env)
 
 uvicorn "app.api:create_app" --factory --port 8000     # API (factory pattern — not app.api:app)
 
@@ -27,6 +34,8 @@ Config comes **only from env vars** (`app/config.py`); tests construct `Config` 
 ## Architecture
 
 Pipeline (`app/uploader.py: run_pass`): flock lock → scan folder → ingest new files → send records sequentially → archive completed files → write `runs` row → Telegram alert. Every record update commits its own transaction, so a crash mid-pass loses no progress.
+
+Enricher (`app/enricher.py: run_enrich`, own flock): scan `raw_folder` (same FILE_GLOB/mtime rules via `scan_folder(folder=...)`) → per file: parse lines, one batch MySQL query for all dlrefs (`fetch_deals_data`, injectable in tests) → `enrich_line` builds the subject from the NEWEST application's snapshot (`vdate` = `applied_at`, `users` fallback for passport/phone) → enriched file written atomically into the inbox, quarantined lines (`{"line_no","reason","line"}`) + raw file moved aside → `enriched_files` row (identity = filename+sha256, same idempotency pattern) → Telegram alert on quarantines/errors. Quarantine reasons that BLOCK a line: broken JSON, missing/unknown dlref, deals of different clients, **inn mismatch vs `users.social_number`** (never risk another person's credit history), unsupported passport format (2 letters+6 digits → dtype 1; 9 digits → dtype 17 sent WITHOUT eddr in v1), **empty document issuer `dwho`** (live-confirmed: the bureau drops such docs via IGNORED 3003 → CRITICAL 2077 rejects the package; ~20% of cabinet clients had it empty on the first mass run), no valid phone. Optional dictionary fields (csex/family/ceduc/…) are deliberately not sent in v1 — the id→UBKI-code mappings live in the OctoberCMS code, not in the DB.
 
 Key invariants that span multiple files:
 
@@ -46,6 +55,7 @@ UBKI protocol details (endpoints, envelope shape, wiki links, error codes) are d
 - JSON logging (`app/jsonlog.py`) passes `extra` keys straight into `LogRecord`: reserved attribute names (`filename`, `module`, `lineno`, …) raise `KeyError` at runtime. Use `file`, `line_no`, etc. Tests enable INFO level via an autouse fixture precisely to catch this — keep that fixture.
 - `fastapi.testclient` / `httpx.MockTransport` are the only HTTP mocking tools used; there is no responses/respx dependency.
 - Python 3.12 in Docker; local venv is 3.14 — don't use 3.13+-only features.
+- **Never touch the SQLite file from the macOS host while containers are writing** (bind mount = two kernels; host-side `sqlite3` reads during an active pass silently ate committed WAL frames on a live run — 39 record updates vanished). Inspect via `docker compose exec … python/sqlite` or the API instead.
 - The API is deliberately not CRUD: the DB records transmission facts. The only mutations are the token-guarded retry endpoints (`failed|rejected` → `pending`) and `POST /run`.
 
 ## Live verification status
