@@ -70,6 +70,16 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def unique_target(folder: Path, name: str, sha256: str) -> Path:
+    """`folder/name`, or a sha-prefixed variant when the name is already taken.
+    Shared by the archiver and the enricher so the collision-suffix scheme stays
+    identical across both."""
+    target = folder / name
+    if target.exists():
+        target = folder / f"{sha256[:8]}_{name}"
+    return target
+
+
 def scan_folder(config: Config, summary=None, folder: Path | None = None) -> list[Path]:
     """Files matching file_glob in the folder (default: the uploader inbox),
     older than min_file_age_sec (a guard against half-written files).
@@ -128,25 +138,35 @@ def ingest_new_files(conn: Connection, paths: list[Path], summary: RunSummary, d
         db.insert_file(conn, path.name, sha, path.stat().st_size, lines)
 
 
-def send_records(conn: Connection, config: Config, client: UbkiClient, summary: RunSummary) -> None:
+def send_records(conn: Connection, config: Config, client: UbkiClient, summary: RunSummary) -> set[int]:
+    """Send sendable records; returns the set of file_ids whose records were
+    updated this pass so the caller can recompute just those (plus the still
+    -active files) instead of every file ever ingested."""
+    touched: set[int] = set()
     records = db.sendable_records(conn, config.retry_cap)
     if not records:
         log.info("nothing to send", extra={"event": "send_skip"})
-        return
+        return touched
     log.info("sending records", extra={"event": "send_start", "count": len(records)})
     consecutive_network_errors = 0
     for record in records:
+        touched.add(record["file_id"])
         raw_line = record["raw_line"]
-        # UBKI's 2MB limit applies to the whole request, envelope included
-        if len(build_envelope(raw_line, record["uuid"])) > config.max_line_bytes:
+        # UBKI's 2MB limit applies to the whole request, envelope included; build
+        # it once here and reuse it for the send so it isn't serialized twice.
+        envelope = build_envelope(raw_line, record["uuid"])
+        if len(envelope) > config.max_line_bytes:
             db.update_record_result(
                 conn, record["id"], REJECTED,
                 last_error=f"request envelope exceeds {config.max_line_bytes} bytes, not sent",
             )
             summary.records_rejected += 1
+            # a local reject makes no network call, so it is evidence neither
+            # that UBKI recovered nor that it is down: leave the streak counter
+            # untouched (do NOT reset it as the send path below does on success).
             continue
 
-        result = client.upload_record(raw_line, record["uuid"])
+        result = client.upload_record(raw_line, record["uuid"], envelope=envelope)
         # network-like failures don't burn attempts: retry_cap guards against
         # permanently-bad records, not against UBKI/transport outages (an
         # outage must never exhaust a record's auto-retries)
@@ -184,9 +204,10 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
                     "pass aborted: UBKI unreachable or erroring",
                     extra={"event": "abort_network", "last_error": result.error},
                 )
-                return
+                return touched
         else:
             consecutive_network_errors = 0
+    return touched
 
 
 def archive_completed_files(conn: Connection, config: Config, summary: RunSummary) -> None:
@@ -204,9 +225,7 @@ def archive_completed_files(conn: Connection, config: Config, summary: RunSummar
             db.mark_archived(conn, row["id"])
             continue
         config.archive_folder.mkdir(exist_ok=True)
-        target = config.archive_folder / row["filename"]
-        if target.exists():
-            target = config.archive_folder / f"{row['sha256'][:8]}_{row['filename']}"
+        target = unique_target(config.archive_folder, row["filename"], row["sha256"])
         source.rename(target)
         db.mark_archived(conn, row["id"])
         summary.files_archived += 1
@@ -273,12 +292,21 @@ def _run_locked(config: Config, client: UbkiClient | None, summary: RunSummary) 
 
         if client is None:
             client = UbkiClient(config, session_store=DbSessionStore(conn))
-        send_records(conn, config, client, summary)
+        touched = send_records(conn, config, client, summary)
 
-        # over ALL files, not records: covers files ingested with zero records
-        # AND archived files whose records were manually retried and re-sent
-        for row in conn.execute("SELECT id FROM files").fetchall():
-            db.recompute_file_status(conn, row["id"])
+        # Recompute the active files (not yet archived — covers files ingested
+        # this pass, including zero-record ones, and any in-progress file) plus
+        # the files whose records this pass touched. The latter is what catches
+        # an ARCHIVED file whose record was manually retried and re-sent: it is
+        # no longer in the active set but is in `touched`. Bounded by the active
+        # backlog + this pass's work, not by every file ever ingested.
+        recompute_ids = {
+            row["id"] for row in
+            conn.execute("SELECT id FROM files WHERE archived_at IS NULL").fetchall()
+        }
+        recompute_ids |= touched
+        for file_id in recompute_ids:
+            db.recompute_file_status(conn, file_id)
         archive_completed_files(conn, config, summary)
 
         # an aborted pass must not advance last_successful_run (health 25h rule)

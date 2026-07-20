@@ -39,10 +39,14 @@ def create_app(config: Config | None = None) -> FastAPI:
     if not logging.getLogger().handlers:
         setup_logging()
     config = config or load_config()
+    # bootstrap the schema once at startup so per-request connections can skip
+    # the DDL script + commit (the API is read-heavy); still standalone-safe if
+    # the API comes up before the uploader has ever created the DB.
+    db.connect(config.db_path).close()
     app = FastAPI(title="ubki-uploader")
 
     def get_conn():
-        conn = db.connect(config.db_path)
+        conn = db.connect(config.db_path, ensure_schema=False)
         try:
             yield conn
         finally:

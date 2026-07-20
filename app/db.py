@@ -81,14 +81,20 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect(db_path: Path | str) -> sqlite3.Connection:
+def connect(db_path: Path | str, *, ensure_schema: bool = True) -> sqlite3.Connection:
+    """Open a connection. `ensure_schema=False` skips the (idempotent but not
+    free) DDL bootstrap + its commit — used by the read-heavy API, whose factory
+    bootstraps the schema once at startup, so per-request connections need not
+    re-run it. PRAGMAs stay: they are cheap and journal_mode/foreign_keys are
+    connection-scoped."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(SCHEMA)
-    conn.commit()
+    if ensure_schema:
+        conn.executescript(SCHEMA)
+        conn.commit()
     return conn
 
 

@@ -190,13 +190,17 @@ class UbkiClient:
 
     # --- upload --------------------------------------------------------------
 
-    def upload_record(self, raw_line: str, reqidout: str) -> UploadResult:
+    def upload_record(self, raw_line: str, reqidout: str, *,
+                      envelope: bytes | None = None) -> UploadResult:
+        # `envelope` lets the caller pass the bytes it already built for the
+        # size check, so the envelope isn't serialized twice per record; when
+        # omitted it is built here from raw_line/reqidout.
         try:
             sessid = self._ensure_session()
         except UbkiAuthError as exc:
             return UploadResult(status=FAILED, error=str(exc), is_network_error=True)
 
-        result = self._post_record(raw_line, reqidout, sessid)
+        result = self._post_record(raw_line, reqidout, sessid, envelope=envelope)
         if result is not None:
             return result
         # session was stale (2014 / 401): re-auth once and retry
@@ -207,16 +211,19 @@ class UbkiClient:
         # A session rejected even after a fresh auth means nothing will go
         # through this pass (and re-authing per record is exactly what UBKI
         # forbids) — flag it network-like so the 3-strike abort kicks in.
-        return self._post_record(raw_line, reqidout, sessid) or UploadResult(
+        return self._post_record(raw_line, reqidout, sessid, envelope=envelope) or UploadResult(
             status=FAILED, error="session rejected twice", is_network_error=True
         )
 
-    def _post_record(self, raw_line: str, reqidout: str, sessid: str) -> UploadResult | None:
+    def _post_record(self, raw_line: str, reqidout: str, sessid: str, *,
+                     envelope: bytes | None = None) -> UploadResult | None:
         """Returns None when the session must be refreshed and the call retried."""
+        if envelope is None:
+            envelope = build_envelope(raw_line, reqidout)
         try:
             resp = self._client.post(
                 self._upload_url,
-                content=build_envelope(raw_line, reqidout),
+                content=envelope,
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json",

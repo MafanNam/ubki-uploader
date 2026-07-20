@@ -54,7 +54,7 @@ UBKI protocol details (endpoints, envelope shape, wiki links, error codes) are d
 
 - JSON logging (`app/jsonlog.py`) passes `extra` keys straight into `LogRecord`: reserved attribute names (`filename`, `module`, `lineno`, …) raise `KeyError` at runtime. Use `file`, `line_no`, etc. Tests enable INFO level via an autouse fixture precisely to catch this — keep that fixture.
 - `fastapi.testclient` / `httpx.MockTransport` are the only HTTP mocking tools used; there is no responses/respx dependency.
-- Python 3.12 in Docker; local venv is 3.14 — don't use 3.13+-only features.
+- Python 3.12 in Docker; local venv is 3.14 — don't use 3.14+-only features.
 - **Never touch the SQLite file from the macOS host while containers are writing** (bind mount = two kernels; host-side `sqlite3` reads during an active pass silently ate committed WAL frames on a live run — 39 record updates vanished). Inspect via `docker compose exec … python/sqlite` or the API instead.
 - The API is deliberately not CRUD: the DB records transmission facts. The only mutations are the token-guarded retry endpoints (`failed|rejected` → `pending`) and `POST /run`.
 
