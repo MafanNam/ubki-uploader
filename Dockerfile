@@ -21,7 +21,7 @@ RUN case "${TARGETARCH}" in \
     && echo "${SHA1SUM}  /usr/local/bin/supercronic" | sha1sum -c - \
     && chmod +x /usr/local/bin/supercronic
 
-WORKDIR /srv/ubki-uploader
+WORKDIR /src/ubki-uploader
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
