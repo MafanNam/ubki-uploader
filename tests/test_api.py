@@ -47,6 +47,19 @@ def iso(dt: datetime) -> str:
 
 # --- health ----------------------------------------------------------------
 
+def test_api_bootstraps_schema_on_empty_db(cfg):
+    # get_conn opens connections with ensure_schema=False, so the factory must
+    # bootstrap the schema once at startup — the API stays standalone-safe even
+    # if it comes up before the uploader has ever created the DB.
+    assert not cfg.db_path.exists()
+    app = create_app(cfg)
+    assert cfg.db_path.exists()  # created by the factory bootstrap
+    with TestClient(app) as client:
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "degraded"  # no successful run yet
+
+
 def test_health_degraded_without_any_run(api):
     body = api.get("/health").json()
     assert body["status"] == "degraded"

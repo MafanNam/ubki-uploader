@@ -241,6 +241,29 @@ def test_run_enrich_is_idempotent_by_identity(cfg):
     assert len((cfg.data_folder / "a.jsonl").read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_quarantine_write_idempotent_after_crash_rerun(cfg):
+    """A crash between the quarantine write and the enriched_files commit must
+    not leave a DUPLICATE quarantine file when the raw is reprocessed: the
+    identical file is reused, not re-emitted under a sha-prefixed name."""
+    raw = json.dumps(make_line(), ensure_ascii=False)
+    write_jsonl(cfg.raw_folder, "a.jsonl", [raw])
+    run_enrich(cfg, fetch=fake_fetch({}))  # dlref not in cabinet -> quarantined
+    assert [p.name for p in cfg.quarantine_folder.iterdir()] == ["a.jsonl"]
+
+    # reconstruct the pre-crash state: raw back in RAW_FOLDER, no idempotency row
+    # (the crash happened after the quarantine write, before the DB commit)
+    write_jsonl(cfg.raw_folder, "a.jsonl", [raw])
+    conn = db.connect(cfg.db_path)
+    conn.execute("DELETE FROM enriched_files")
+    conn.commit()
+    conn.close()
+
+    run_enrich(cfg, fetch=fake_fetch({}))
+    survivors = sorted(p.name for p in cfg.quarantine_folder.iterdir()
+                       if not p.name.startswith("."))
+    assert survivors == ["a.jsonl"]  # no {sha}_a.jsonl duplicate
+
+
 def test_dry_run_touches_nothing(cfg):
     write_jsonl(cfg.raw_folder, "a.jsonl", [json.dumps(make_line(), ensure_ascii=False)])
 

@@ -66,7 +66,8 @@ class FakeClient:
         self.calls: list[tuple[str, str]] = []
         self.closed = False
 
-    def upload_record(self, raw_line: str, reqidout: str) -> UploadResult:
+    def upload_record(self, raw_line: str, reqidout: str, *,
+                      envelope: bytes | None = None) -> UploadResult:
         self.calls.append((raw_line, reqidout))
         if len(self.results) > 1:
             return self.results.pop(0)

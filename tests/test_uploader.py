@@ -1,5 +1,7 @@
 """Integration of run_pass with a scripted fake client."""
 
+import dataclasses
+
 import pytest
 
 from app import db
@@ -252,6 +254,56 @@ def test_manual_retry_resets_rejected_and_resends(cfg):
     row = file_row(cfg)
     assert row["status"] == SENT
     assert row["archived_at"] is not None
+
+
+def test_recompute_scope_covers_resent_archived_and_new_zero_record(cfg):
+    """The scoped recompute (active files ∪ files touched this pass) must still
+    reach an ARCHIVED file whose record was manually retried and re-sent (only
+    reachable via `touched`) AND a brand-new zero-record file ingested this pass
+    (only reachable via the `archived_at IS NULL` active set)."""
+    # file A: one line rejected -> file archived as REJECTED
+    write_jsonl(cfg.data_folder, "a.jsonl", LINES[:1])
+    run_pass(cfg, client=FakeClient([rejected_result()]))
+    conn = db.connect(cfg.db_path)
+    a_row = conn.execute("SELECT * FROM files WHERE filename = 'a.jsonl'").fetchone()
+    assert a_row["archived_at"] is not None
+    rec_id = conn.execute("SELECT id FROM records WHERE file_id = ?", (a_row["id"],)).fetchone()["id"]
+    assert db.reset_records(conn, record_id=rec_id) == 1  # rejected -> pending
+    conn.close()
+
+    # pass 2: A is archived (reachable only via touched); B is a fresh empty file
+    write_jsonl(cfg.data_folder, "b.jsonl", ["", "  "])
+    summary = run_pass(cfg, client=FakeClient([sent_result()]))
+
+    assert summary.records_sent == 1
+    conn = db.connect(cfg.db_path)
+    try:
+        a = conn.execute("SELECT * FROM files WHERE filename = 'a.jsonl'").fetchone()
+        b = conn.execute("SELECT * FROM files WHERE filename = 'b.jsonl'").fetchone()
+    finally:
+        conn.close()
+    assert a["status"] == SENT                       # re-sent archived file recomputed
+    assert b["status"] == SENT and b["archived_at"] is not None  # new zero-record file
+
+
+def test_local_reject_does_not_reset_network_streak(cfg):
+    """A local oversized-reject makes no network call, so it must NOT reset the
+    consecutive-network-error counter: interleaved transport errors still abort."""
+    small = dataclasses.replace(cfg, max_line_bytes=200)
+    net_line = '{"inn":"1"}'                          # envelope well under 200 bytes
+    big_line = '{"x":"' + "a" * 500 + '"}'            # envelope over 200 -> local reject
+    write_jsonl(small.data_folder, "a.jsonl",
+                [net_line, big_line, net_line, big_line, net_line])
+    client = FakeClient([network_failed_result()])
+    summary = run_pass(small, client=client)
+
+    # net(1) -> oversized(frozen) -> net(2) -> oversized(frozen) -> net(3)=abort;
+    # had the local rejects reset the streak, it would never reach 3.
+    assert summary.aborted is True
+    assert len(client.calls) == small.network_abort_threshold  # only the 3 network records
+    statuses = record_statuses(small)
+    assert statuses.count(FAILED) == 3
+    assert statuses.count(REJECTED) == 2
 
 
 def test_seeded_session_is_used_by_next_pass(cfg):

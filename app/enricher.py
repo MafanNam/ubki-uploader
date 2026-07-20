@@ -41,7 +41,7 @@ from typing import Callable
 from . import db
 from .alerts import send_telegram
 from .config import Config
-from .uploader import scan_folder, sha256_of
+from .uploader import scan_folder, sha256_of, unique_target
 
 log = logging.getLogger("ubki.enricher")
 
@@ -317,13 +317,6 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config) -> tuple[
 
 # --- file processing ---------------------------------------------------------
 
-def _unique_target(folder: Path, name: str, sha256: str) -> Path:
-    target = folder / name
-    if target.exists():
-        target = folder / f"{sha256[:8]}_{name}"
-    return target
-
-
 def _read_numbered_lines(path: Path) -> list[tuple[int, str]]:
     """Non-blank lines paired with their TRUE 1-based line number in the file,
     so a quarantine record points the operator at the right line even when the
@@ -419,18 +412,30 @@ def process_file(conn: Connection, config: Config, path: Path,
     if quarantined:
         config.quarantine_folder.mkdir(parents=True, exist_ok=True)
         # same filename as the source: dropping it back into RAW_FOLDER for a
-        # re-run works without renaming (it still matches FILE_GLOB)
-        qtarget = _unique_target(config.quarantine_folder, path.name, sha)
-        qtarget.write_text(
-            "\n".join(json.dumps(record, ensure_ascii=False) for record in quarantined) + "\n",
-            encoding="utf-8",
-        )
+        # re-run works without renaming (it still matches FILE_GLOB). Written
+        # reuse-if-identical + atomically (like _write_enriched) so a crash
+        # between this write and the enriched_files idempotency row committed
+        # below cannot leave a DUPLICATE quarantine file on reprocess: the
+        # raw->quarantine transform is deterministic, so a byte-identical file
+        # already under this name is our own prior attempt — reuse it. A
+        # different file under the name (an earlier, unconsumed quarantine) is
+        # preserved via the sha prefix.
+        data = (
+            "\n".join(json.dumps(record, ensure_ascii=False) for record in quarantined) + "\n"
+        ).encode("utf-8")
+        qtarget = config.quarantine_folder / path.name
+        if qtarget.exists() and qtarget.read_bytes() != data:
+            qtarget = unique_target(config.quarantine_folder, path.name, sha)
+        if not (qtarget.exists() and qtarget.read_bytes() == data):
+            tmp = qtarget.with_name(f".{qtarget.name}.tmp")
+            tmp.write_bytes(data)
+            tmp.rename(qtarget)
         log.warning("quarantine written", extra={
             "event": "file_quarantine", "file": path.name,
             "target": str(qtarget), "count": len(quarantined)})
 
     config.processed_folder.mkdir(parents=True, exist_ok=True)
-    path.rename(_unique_target(config.processed_folder, path.name, sha))
+    path.rename(unique_target(config.processed_folder, path.name, sha))
 
     db.insert_enriched_file(conn, path.name, sha, len(numbered), len(enriched), len(quarantined))
     summary.lines_enriched += len(enriched)
