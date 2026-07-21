@@ -30,7 +30,7 @@ services:
   scheduler:
     build: .
     restart: unless-stopped
-    command: ["supercronic", "-json", "/srv/ubki-uploader/crontab"]
+    command: ["supercronic", "-json", "/src/ubki-uploader/crontab"]
     env_file: .env
     environment:
       RAW_FOLDER: /ubki-data
