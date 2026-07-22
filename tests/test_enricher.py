@@ -1,6 +1,8 @@
 """Enricher: fo_cki assembly rules, quarantine reasons, file flow."""
 
 import json
+import os
+import time
 from datetime import date, datetime
 
 from app import db
@@ -9,7 +11,7 @@ from app.enricher import (
     run_enrich, unwrap_quarantine,
 )
 
-from .conftest import write_jsonl
+from .conftest import OLD_ENOUGH, write_jsonl
 
 INN = "3418011570"
 
@@ -228,6 +230,20 @@ def test_run_enrich_writes_inbox_quarantine_and_processed(cfg):
 
     alert = build_alert(summary)
     assert "карантині: 2" in alert
+
+
+def test_run_enrich_falls_back_to_cp1251(cfg):
+    raw = json.dumps(make_line(), ensure_ascii=False)
+    path = cfg.raw_folder / "a.jsonl"
+    path.write_bytes(raw.encode("cp1251"))
+    old = time.time() - OLD_ENOUGH
+    os.utime(path, (old, old))
+
+    summary = run_enrich(cfg, fetch=fake_fetch({"395397": make_row()}))
+
+    assert (summary.files_processed, summary.lines_enriched) == (1, 1)
+    enriched = json.loads((cfg.data_folder / "a.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert enriched["lname"] == "Іванов"
 
 
 def test_run_enrich_is_idempotent_by_identity(cfg):

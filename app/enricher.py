@@ -317,13 +317,29 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config) -> tuple[
 
 # --- file processing ---------------------------------------------------------
 
+_FALLBACK_ENCODINGS = ("cp1251",)  # producer occasionally exports Cyrillic fields in Windows codepage
+
+
 def _read_numbered_lines(path: Path) -> list[tuple[int, str]]:
     """Non-blank lines paired with their TRUE 1-based line number in the file,
     so a quarantine record points the operator at the right line even when the
     raw file has blank lines (read_lines drops blanks and loses the mapping)."""
-    with path.open("r", encoding="utf-8") as fh:
-        return [(n, line.rstrip("\r\n"))
-                for n, line in enumerate(fh, start=1) if line.strip()]
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        for encoding in _FALLBACK_ENCODINGS:
+            try:
+                text = raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            log.warning("raw file not UTF-8, decoded with fallback encoding", extra={
+                "event": "raw_file_fallback_encoding", "file": path.name, "encoding": encoding})
+            break
+        else:
+            raise
+    lines = text.splitlines()
+    return [(n, line) for n, line in enumerate(lines, start=1) if line.strip()]
 
 
 def _write_enriched(folder: Path, name: str, sha256: str, lines: list[str]) -> Path:
