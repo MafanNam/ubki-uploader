@@ -392,3 +392,62 @@ def test_fresh_session_saved_to_store(cfg):
     with UbkiClient(cfg, session_store=store, transport=httpx.MockTransport(handler)) as client:
         client.upload_record(RAW_LINE, "rid1")
     assert store.saved == ["SESS123"]
+
+
+# --- send_prepared: the stateless POST used by the concurrent path -----------
+
+def test_send_prepared_maps_ok_without_authing(cfg):
+    """send_prepared must never auth (the main thread owns the session) and must
+    send the caller-supplied sessid verbatim."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert not request.url.path.endswith("/auth"), "send_prepared must not auth"
+        assert request.headers["SessId"] == "SEED"
+        return upload_response({"state": "ok"})
+
+    env = build_envelope(RAW_LINE, "rid1")
+    with make_client(cfg, handler) as client:
+        result = client.send_prepared(env, "SEED")
+
+    assert result.status == SENT
+    assert result.session_expired is False
+
+
+def test_send_prepared_flags_session_expired_on_401(cfg):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="unauthorized")
+
+    env = build_envelope(RAW_LINE, "rid1")
+    with make_client(cfg, handler) as client:
+        result = client.send_prepared(env, "SEED")
+
+    assert result.status == FAILED
+    assert result.session_expired is True
+    assert result.is_network_error is True
+
+
+def test_send_prepared_flags_session_expired_on_2014(cfg):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return upload_response({"sentdatainfo": {"main_errcode": 2014}})
+
+    env = build_envelope(RAW_LINE, "rid1")
+    with make_client(cfg, handler) as client:
+        result = client.send_prepared(env, "SEED")
+
+    assert result.session_expired is True
+    assert result.is_network_error is True
+
+
+def test_send_prepared_rejection_is_not_session_expired(cfg):
+    """A UBKI validation reject (state=er on HTTP 400) is terminal, not a session
+    problem: it must NOT be flagged session_expired (no re-auth churn)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"sentdatainfo": {"state": "er", "er": 1,
+                                                           "errtext": "bad inn"}})
+
+    env = build_envelope(RAW_LINE, "rid1")
+    with make_client(cfg, handler) as client:
+        result = client.send_prepared(env, "SEED")
+
+    assert result.status == REJECTED
+    assert result.session_expired is False
+    assert result.is_network_error is False

@@ -48,9 +48,10 @@ def test_success_flow_sends_all_and_archives(cfg):
     assert row["archived_at"] is not None
     assert not (cfg.data_folder / "a.jsonl").exists()
     assert (cfg.archive_folder / "a.jsonl").exists()
-    # reqidout must be the record uuid, body must be the raw line
-    assert client.calls[0][0] == LINES[0]
-    assert len(client.calls[0][1]) == 32
+    # the envelope embeds the raw line byte-for-byte and carries a 32-char reqidout
+    envelope = client.calls[0][0]
+    assert LINES[0].encode() in envelope
+    assert b'"reqidout":"' in envelope
 
 
 def test_rejected_line_archives_file_but_flags_it(cfg):

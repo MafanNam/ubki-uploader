@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -40,6 +41,11 @@ def cfg(tmp_path: Path) -> Config:
         min_file_age_sec=300,
         file_glob="*.jsonl",  # prod default is *.txt; tests use .jsonl names
         raw_folder=raw_folder,
+        # deterministic default for the existing single-threaded assertions: one
+        # worker (completion order == submission order) and no rate pacing.
+        # Concurrency-specific tests override these explicitly.
+        ubki_concurrency=1,
+        ubki_max_rps=1_000_000.0,
     )
 
 
@@ -59,19 +65,40 @@ def write_jsonl(folder: Path, name: str, lines: list[str], age_sec: int = OLD_EN
 
 
 class FakeClient:
-    """Scripted UbkiClient stand-in: yields queued results, then repeats the last."""
+    """Scripted UbkiClient stand-in: yields queued results, then repeats the last.
+    Thread-safe so it can back the concurrent send path at any pool size."""
 
     def __init__(self, results: list[UploadResult] | None = None):
         self.results = list(results or [UploadResult(status=SENT, state="ok")])
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple] = []  # one entry per network send (send_prepared)
+        self.auth_calls = 0
+        self.reauth_calls = 0
         self.closed = False
+        self._lock = threading.Lock()
 
-    def upload_record(self, raw_line: str, reqidout: str, *,
-                      envelope: bytes | None = None) -> UploadResult:
-        self.calls.append((raw_line, reqidout))
+    def _next(self) -> UploadResult:
         if len(self.results) > 1:
             return self.results.pop(0)
         return self.results[0]
+
+    def ensure_session(self) -> str:
+        self.auth_calls += 1
+        return "fake-sessid"
+
+    def reauth(self) -> str:
+        self.reauth_calls += 1
+        return "fake-sessid"
+
+    def send_prepared(self, envelope: bytes, sessid: str) -> UploadResult:
+        with self._lock:
+            self.calls.append((envelope, sessid))
+            return self._next()
+
+    def upload_record(self, raw_line: str, reqidout: str, *,
+                      envelope: bytes | None = None) -> UploadResult:
+        with self._lock:
+            self.calls.append((raw_line, reqidout))
+            return self._next()
 
     def close(self) -> None:
         self.closed = True
