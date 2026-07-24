@@ -29,6 +29,12 @@ class Config:
     max_line_bytes: int = 2 * 1024 * 1024
     network_abort_threshold: int = 3
     http_timeout_sec: float = 60.0
+    # parallel send: worker pool size and a hard requests/second ceiling.
+    # UBKI accepts up to 30 packets/sec; we send at 25 with margin. The pool
+    # bounds simultaneous in-flight requests; the rate cap paces starts so the
+    # bureau's per-second limit is never exceeded regardless of pool size.
+    ubki_concurrency: int = 8
+    ubki_max_rps: float = 25.0
     # enricher: raw producer files + cabinet MySQL (required only by app.enrich)
     raw_folder: Path | None = None
     mysql_host: str | None = None
@@ -82,6 +88,8 @@ def load_config() -> Config:
         retry_cap=int(os.environ.get("RETRY_CAP") or 5),
         min_file_age_sec=int(os.environ.get("MIN_FILE_AGE_SEC") or 300),
         file_glob=os.environ.get("FILE_GLOB", "").strip() or "*.txt",
+        ubki_concurrency=int(os.environ.get("UBKI_CONCURRENCY") or 8),
+        ubki_max_rps=float(os.environ.get("UBKI_MAX_RPS") or 25.0),
         raw_folder=Path(raw) if (raw := os.environ.get("RAW_FOLDER", "").strip()) else None,
         mysql_host=os.environ.get("MYSQL_HOST") or None,
         mysql_port=int(os.environ.get("MYSQL_PORT") or 3306),

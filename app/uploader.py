@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import itertools
 import logging
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
@@ -18,7 +20,14 @@ from . import db
 from .alerts import send_telegram
 from .config import Config
 from .db import FAILED, REJECTED, SENT, utcnow
-from .ubki_client import UbkiClient, build_envelope, kyiv_today
+from .ratelimit import RateLimiter
+from .ubki_client import (
+    UbkiAuthError,
+    UbkiClient,
+    UploadResult,
+    build_envelope,
+    kyiv_today,
+)
 
 log = logging.getLogger("ubki.uploader")
 
@@ -139,37 +148,44 @@ def ingest_new_files(conn: Connection, paths: list[Path], summary: RunSummary, d
 
 
 def send_records(conn: Connection, config: Config, client: UbkiClient, summary: RunSummary) -> set[int]:
-    """Send sendable records; returns the set of file_ids whose records were
-    updated this pass so the caller can recompute just those (plus the still
-    -active files) instead of every file ever ingested."""
+    """Send sendable records concurrently (up to `ubki_concurrency` workers,
+    paced to `ubki_max_rps`) and return the set of file_ids touched so the caller
+    recomputes just those (plus the still-active files).
+
+    Thread ownership is strict: worker threads only build an envelope and do the
+    stateless POST (`client.send_prepared`); this thread owns the session, every
+    DB write, the summary, and the abort accounting. That keeps the single SQLite
+    connection and `self._sessid` single-threaded, and honours UBKI's
+    "authenticate once per day" rule (auth happens here, once, before fan-out)."""
     touched: set[int] = set()
     records = db.sendable_records(conn, config.retry_cap)
     if not records:
         log.info("nothing to send", extra={"event": "send_skip"})
         return touched
-    log.info("sending records", extra={"event": "send_start", "count": len(records)})
-    consecutive_network_errors = 0
-    for record in records:
-        touched.add(record["file_id"])
-        raw_line = record["raw_line"]
-        # UBKI's 2MB limit applies to the whole request, envelope included; build
-        # it once here and reuse it for the send so it isn't serialized twice.
-        envelope = build_envelope(raw_line, record["uuid"])
-        if len(envelope) > config.max_line_bytes:
-            db.update_record_result(
-                conn, record["id"], REJECTED,
-                last_error=f"request envelope exceeds {config.max_line_bytes} bytes, not sent",
-            )
-            summary.records_rejected += 1
-            # a local reject makes no network call, so it is evidence neither
-            # that UBKI recovered nor that it is down: leave the streak counter
-            # untouched (do NOT reset it as the send path below does on success).
-            continue
+    log.info(
+        "sending records",
+        extra={"event": "send_start", "count": len(records),
+               "concurrency": config.ubki_concurrency, "max_rps": config.ubki_max_rps},
+    )
 
-        result = client.upload_record(raw_line, record["uuid"], envelope=envelope)
+    # Auth once, on this thread, before any worker runs. A failure here means the
+    # whole pass is blocked: abort so the health 25h rule keeps ticking.
+    try:
+        sessid = client.ensure_session()
+    except UbkiAuthError as exc:
+        summary.aborted = True
+        summary.errors.append(f"auth failed, pass aborted: {exc}")
+        log.error("pass aborted: cannot authenticate with UBKI",
+                  extra={"event": "abort_auth", "error": str(exc)})
+        return touched
+
+    limiter = RateLimiter(config.ubki_max_rps)
+    streak = 0  # consecutive network-like errors, in completion order
+
+    def commit(record, result: UploadResult, *, count_summary: bool = True) -> None:
+        touched.add(record["file_id"])
         # network-like failures don't burn attempts: retry_cap guards against
-        # permanently-bad records, not against UBKI/transport outages (an
-        # outage must never exhaust a record's auto-retries)
+        # permanently-bad records, not against UBKI/transport outages.
         db.update_record_result(
             conn, record["id"], result.status,
             last_error=result.error, ubki_response=result.response_text,
@@ -183,6 +199,11 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
                 "status": result.status, "state": result.state, "error": result.error,
             },
         )
+        # count_summary=False for a stale-session record in the first wave: it is
+        # written FAILED to the DB (crash-safe) but not tallied, because it will
+        # be resent under a fresh session and counted by its final outcome then.
+        if not count_summary:
+            return
         if result.status == SENT:
             summary.records_sent += 1
             if result.has_warnings:
@@ -192,21 +213,96 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
         else:
             summary.records_failed += 1
 
-        if result.is_network_error:
-            consecutive_network_errors += 1
-            if consecutive_network_errors >= config.network_abort_threshold:
-                summary.aborted = True
-                summary.errors.append(
-                    f"aborted after {consecutive_network_errors} consecutive"
-                    " network-like errors (transport/5xx/sy/session)"
-                )
-                log.error(
-                    "pass aborted: UBKI unreachable or erroring",
-                    extra={"event": "abort_network", "last_error": result.error},
-                )
-                return touched
+    def send_one(record) -> UploadResult:
+        # Runs on a worker thread. Build the envelope lazily here (not up front)
+        # so at most `ubki_concurrency` envelopes are alive at once — memory
+        # stays bounded even for large files. UBKI's 2 MB limit covers the whole
+        # request; a local reject makes no network call and skips the rate slot.
+        envelope = build_envelope(record["raw_line"], record["uuid"])
+        if len(envelope) > config.max_line_bytes:
+            return UploadResult(
+                status=REJECTED, is_local_reject=True,
+                error=f"request envelope exceeds {config.max_line_bytes} bytes, not sent",
+            )
+        limiter.acquire()
+        return client.send_prepared(envelope, sessid)
+
+    def run_wave(wave, *, final: bool) -> tuple[list, bool]:
+        """Bounded-concurrency send over `wave`. Keeps at most `ubki_concurrency`
+        requests in flight, so an abort dispatches no more than ~concurrency
+        extra sends before it stops submitting. Returns (session_expired records,
+        aborted). Mutates the enclosing `streak`, DB, summary and `touched`.
+
+        `final=False` (first wave): stale-session records are collected for a
+        one-time re-auth+resend and left out of the summary tally. `final=True`
+        (the resend wave): everything counts, since there is no further retry."""
+        nonlocal streak
+        expired: list = []
+        aborted = False
+        pending = iter(wave)
+        with ThreadPoolExecutor(max_workers=config.ubki_concurrency) as ex:
+            in_flight = {
+                ex.submit(send_one, rec): rec
+                for rec in itertools.islice(pending, config.ubki_concurrency)
+            }
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    record = in_flight.pop(fut)
+                    result = fut.result()
+                    resend = result.session_expired and not final
+                    if resend:
+                        expired.append(record)
+                    commit(record, result, count_summary=not resend)
+                    if result.is_network_error:
+                        streak += 1
+                        if streak >= config.network_abort_threshold:
+                            aborted = True
+                    elif not result.is_local_reject:
+                        # a completed network exchange (sent or UBKI-rejected)
+                        # proves UBKI is up; a local reject is neutral evidence.
+                        streak = 0
+                    # refill the window unless we've decided to abort: in-flight
+                    # sends still drain and commit, we just stop dispatching new
+                    # ones so remaining records stay pending for the next pass.
+                    if not aborted:
+                        nxt = next(pending, None)
+                        if nxt is not None:
+                            in_flight[ex.submit(send_one, nxt)] = nxt
+        return expired, aborted
+
+    expired, aborted = run_wave(records, final=False)
+
+    # One-time mid-pass re-auth for stale-session records (cold path: the sessid
+    # is valid until 23:59 Kyiv and the pass runs at 06:00, so this rarely fires).
+    # Records were committed FAILED in the first wave (network-like, attempts not
+    # burned); resend them once under a fresh session. UBKI forbids frequent auth,
+    # so this happens at most once — anything still stale afterwards stays FAILED
+    # and retries next pass.
+    if expired and not aborted:
+        try:
+            sessid = client.reauth()
+        except UbkiAuthError as exc:
+            # can't refresh: the records stay FAILED in the DB (attempts not
+            # burned) and retry next pass; tally them now since this wave won't.
+            summary.records_failed += len(expired)
+            summary.errors.append(f"re-auth failed: {exc}")
+            log.error("re-auth failed mid-pass",
+                      extra={"event": "reauth_failed", "error": str(exc)})
         else:
-            consecutive_network_errors = 0
+            log.info("re-authenticated mid-pass, resending stale-session records",
+                     extra={"event": "reauth", "count": len(expired)})
+            _, aborted_again = run_wave(expired, final=True)
+            aborted = aborted or aborted_again
+
+    if aborted:
+        summary.aborted = True
+        summary.errors.append(
+            f"aborted after {config.network_abort_threshold} consecutive"
+            " network-like errors (transport/5xx/sy/session)"
+        )
+        log.error("pass aborted: UBKI unreachable or erroring",
+                  extra={"event": "abort_network"})
     return touched
 
 

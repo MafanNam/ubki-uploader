@@ -65,6 +65,14 @@ class UploadResult:
     response_text: str | None = None
     error: str | None = None
     is_network_error: bool = False
+    # set by the stateless `send_prepared` path when the session must be
+    # refreshed (401/403/2014): the caller (main thread) owns re-auth, workers
+    # never do. Always paired with is_network_error=True so a stale session
+    # counts toward the pass abort. Unused by the legacy `upload_record` path.
+    session_expired: bool = False
+    # a purely local rejection (oversize envelope) that made NO network call:
+    # neither reset nor increment the consecutive-network-error streak.
+    is_local_reject: bool = False
     has_warnings: bool = False
 
 
@@ -190,17 +198,44 @@ class UbkiClient:
 
     # --- upload --------------------------------------------------------------
 
+    def ensure_session(self) -> str:
+        """Establish (or reuse the cached) sessid on the MAIN thread before any
+        parallel fan-out, so worker threads never trigger an auth. Raises
+        UbkiAuthError when authentication is required but fails."""
+        return self._ensure_session()
+
+    def reauth(self) -> str:
+        """Force a fresh authentication (MAIN thread only). UBKI forbids frequent
+        auth, so the parallel path calls this at most once per pass."""
+        self._sessid = None
+        return self.auth()
+
+    def send_prepared(self, envelope: bytes, sessid: str) -> UploadResult:
+        """Stateless single POST for the parallel send path: does NOT touch the
+        session, `self._sessid`, or the DB, so it is safe to call from worker
+        threads (httpx.Client is thread-safe for concurrent requests). On a stale
+        session it returns `session_expired=True` (network-like) rather than
+        re-authing — the main thread owns re-auth and resubmission, which is how
+        the "authenticate once per day" rule is kept under concurrency."""
+        try:
+            resp = self._post(envelope, sessid)
+        except httpx.HTTPError as exc:
+            return UploadResult(status=FAILED, error=f"network: {exc}", is_network_error=True)
+        return self._interpret_response(resp)
+
     def upload_record(self, raw_line: str, reqidout: str, *,
                       envelope: bytes | None = None) -> UploadResult:
-        # `envelope` lets the caller pass the bytes it already built for the
-        # size check, so the envelope isn't serialized twice per record; when
-        # omitted it is built here from raw_line/reqidout.
+        # Sequential single-record path (API manual retry / back-compat): owns
+        # auth end-to-end. `envelope` lets the caller reuse the bytes it already
+        # built for the size check; when omitted it is built from raw_line.
         try:
             sessid = self._ensure_session()
         except UbkiAuthError as exc:
             return UploadResult(status=FAILED, error=str(exc), is_network_error=True)
+        if envelope is None:
+            envelope = build_envelope(raw_line, reqidout)
 
-        result = self._post_record(raw_line, reqidout, sessid, envelope=envelope)
+        result = self._post_record(envelope, sessid)
         if result is not None:
             return result
         # session was stale (2014 / 401): re-auth once and retry
@@ -211,38 +246,55 @@ class UbkiClient:
         # A session rejected even after a fresh auth means nothing will go
         # through this pass (and re-authing per record is exactly what UBKI
         # forbids) — flag it network-like so the 3-strike abort kicks in.
-        return self._post_record(raw_line, reqidout, sessid, envelope=envelope) or UploadResult(
+        return self._post_record(envelope, sessid) or UploadResult(
             status=FAILED, error="session rejected twice", is_network_error=True
         )
 
-    def _post_record(self, raw_line: str, reqidout: str, sessid: str, *,
-                     envelope: bytes | None = None) -> UploadResult | None:
-        """Returns None when the session must be refreshed and the call retried."""
-        if envelope is None:
-            envelope = build_envelope(raw_line, reqidout)
+    def _post(self, envelope: bytes, sessid: str) -> httpx.Response:
+        return self._client.post(
+            self._upload_url,
+            content=envelope,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "SessId": sessid,
+            },
+        )
+
+    def _post_record(self, envelope: bytes, sessid: str) -> UploadResult | None:
+        """Sequential-path POST. Returns None when the session must be refreshed
+        and the call retried (the stateless `send_prepared` surfaces the same
+        condition as a `session_expired` result instead of retrying in place)."""
         try:
-            resp = self._client.post(
-                self._upload_url,
-                content=envelope,
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "SessId": sessid,
-                },
-            )
+            resp = self._post(envelope, sessid)
         except httpx.HTTPError as exc:
             return UploadResult(status=FAILED, error=f"network: {exc}", is_network_error=True)
+        result = self._interpret_response(resp)
+        if result.session_expired:
+            self._sessid = None
+            return None
+        return result
 
+    def _interpret_response(self, resp: httpx.Response) -> UploadResult:
+        """Map a raw upload response to an UploadResult with NO session or DB
+        side effects. A stale session (401/403, or a 2014 session errcode on a
+        200 body) yields `session_expired=True` (network-like); the caller
+        decides whether/how to re-auth. Shared by both the sequential and the
+        parallel send paths."""
         text = resp.text
         if resp.status_code in (401, 403):
             log.warning(
-                "upload returned %s, refreshing session",
+                "upload returned %s, session marked stale",
                 resp.status_code,
                 extra={"event": "session_rejected", "http_status": resp.status_code,
                        "body": text[:500]},
             )
-            self._sessid = None
-            return None
+            return UploadResult(
+                status=FAILED, http_status=resp.status_code,
+                response_text=text[:RESPONSE_TEXT_LIMIT],
+                error=f"HTTP {resp.status_code} (session rejected)",
+                is_network_error=True, session_expired=True,
+            )
 
         try:
             data = resp.json()
@@ -260,8 +312,12 @@ class UbkiClient:
                 if errcode is None and isinstance(data, dict):
                     errcode = data.get("errcode")
                 if errcode is not None and str(errcode) in SESSION_EXPIRED_ERRCODES:
-                    self._sessid = None
-                    return None
+                    return UploadResult(
+                        status=FAILED, http_status=200,
+                        response_text=text[:RESPONSE_TEXT_LIMIT],
+                        error=f"session errcode {errcode}",
+                        is_network_error=True, session_expired=True,
+                    )
             # state and the counters are read from the same (shallow) `info`
             # so a variant layout can't yield a state without its counters.
             state = info.get("state")
