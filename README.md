@@ -22,8 +22,8 @@ RAW_FOLDER (*.txt від продюсера) ──► parse ──► MySQL (dl
                             flock ──► scan │ *.txt > 5хв │──► ingest (нові filename+sha256)
                                                                    │ рядки → records(pending)
                                                                    ▼
-Telegram-алерт ◄── runs row ◄── archive/ ◄── усі records термінальні ◄── послідовна відправка
-(тільки якщо є проблеми)                        (sent/rejected)          1 рядок = 1 запит
+Telegram-алерт ◄── runs row ◄── archive/ ◄── усі records термінальні ◄── паралельна відправка
+(тільки якщо є проблеми)                        (sent/rejected)      1 рядок = 1 запит, пул + rate-cap
 ```
 
 Статуси record: `pending → sent | failed | rejected`
@@ -64,6 +64,10 @@ docker compose up -d        # api (127.0.0.1:8000) + scheduler (крон 06:00 K
 | `DB_PATH` | ні | `/data/ubki.sqlite3` | ставиться compose'ом |
 | `RETRY_CAP` | ні | `5` | межа авторетраїв для `failed` |
 | `MIN_FILE_AGE_SEC` | ні | `300` | захист від недописаних файлів |
+| `UBKI_CONCURRENCY` | ні | `8` | воркери, що шлють одночасно (розмір пулу) |
+| `UBKI_MAX_RPS` | ні | `25` | тверда стеля запитів/сек (UBKI дозволяє ≤30) |
+
+Ефективний темп ≈ `min(UBKI_CONCURRENCY / latency, UBKI_MAX_RPS)`: щоб «насичувати» стелю rps за низької затримки — підіймай concurrency.
 
 Не винесено в env (константи в `app/config.py`): ліміт запиту 2 MiB, поріг аборту 3, HTTP-таймаут 60с.
 
