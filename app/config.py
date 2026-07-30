@@ -90,6 +90,7 @@ def load_config() -> Config:
         file_glob=os.environ.get("FILE_GLOB", "").strip() or "*.txt",
         ubki_concurrency=int(os.environ.get("UBKI_CONCURRENCY") or 8),
         ubki_max_rps=float(os.environ.get("UBKI_MAX_RPS") or 25.0),
+        network_abort_threshold=int(os.environ.get("NETWORK_ABORT_THRESHOLD") or 3),
         raw_folder=Path(raw) if (raw := os.environ.get("RAW_FOLDER", "").strip()) else None,
         mysql_host=os.environ.get("MYSQL_HOST") or None,
         mysql_port=int(os.environ.get("MYSQL_PORT") or 3306),

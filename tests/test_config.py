@@ -12,7 +12,8 @@ from app.config import load_config
 
 def _base_env(monkeypatch, tmp_path) -> None:
     for key in ("UBKI_URL", "UBKI_AUTH_URL", "DB_PATH", "RETRY_CAP",
-                "MIN_FILE_AGE_SEC", "MYSQL_PORT", "FILE_GLOB"):
+                "MIN_FILE_AGE_SEC", "MYSQL_PORT", "FILE_GLOB",
+                "NETWORK_ABORT_THRESHOLD"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("UBKI_DATA_FOLDER_PATH", str(tmp_path / "inbox"))
     monkeypatch.setenv("UBKI_LOGIN", "login")
@@ -27,11 +28,13 @@ def test_empty_numeric_env_falls_back_to_default(monkeypatch, tmp_path):
     monkeypatch.setenv("RETRY_CAP", "")
     monkeypatch.setenv("MIN_FILE_AGE_SEC", "")
     monkeypatch.setenv("MYSQL_PORT", "")
+    monkeypatch.setenv("NETWORK_ABORT_THRESHOLD", "")
 
     config = load_config()
     assert config.retry_cap == 5
     assert config.min_file_age_sec == 300
     assert config.mysql_port == 3306
+    assert config.network_abort_threshold == 3
 
 
 def test_numeric_env_is_parsed_when_set(monkeypatch, tmp_path):
@@ -39,6 +42,8 @@ def test_numeric_env_is_parsed_when_set(monkeypatch, tmp_path):
     monkeypatch.setenv("RETRY_CAP", "9")
     monkeypatch.setenv("MIN_FILE_AGE_SEC", "42")
     monkeypatch.setenv("MYSQL_PORT", "3307")
+    monkeypatch.setenv("NETWORK_ABORT_THRESHOLD", "30")
 
     config = load_config()
     assert (config.retry_cap, config.min_file_age_sec, config.mysql_port) == (9, 42, 3307)
+    assert config.network_abort_threshold == 30
