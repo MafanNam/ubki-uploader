@@ -48,9 +48,25 @@ def make_line(**over):
     return line
 
 
+def make_peer(user_id=77, number="СЕ311111", issuer="Луцьким РВ УМВС",
+              issued=date(2014, 10, 1), applied=datetime(2025, 6, 1)):
+    """One of the client's OTHER applications, which does carry an issuer."""
+    return {"user_id": user_id, "passport_number": number,
+            "passport_issued_by": issuer, "passport_date": issued,
+            "applied_at": applied}
+
+
 def fake_fetch(rows):
     def fetch(config, dlrefs):
         return {ref: rows[ref] for ref in dlrefs if ref in rows}
+    return fetch
+
+
+def fake_issuer_fetch(peers_by_user, calls=None):
+    def fetch(config, user_ids):
+        if calls is not None:
+            calls.append(list(user_ids))
+        return {uid: peers_by_user[uid] for uid in user_ids if uid in peers_by_user}
     return fetch
 
 
@@ -145,6 +161,126 @@ def test_issuer_fallback_to_users_doc(cfg):
     doc = subject["docs"][0]
     assert (doc["dtype"], doc["dnom"], doc["dwho"]) == ("17", "123456789", "8888")
     assert doc["dterm"] == "2030-02-28"  # leap-day issue date handled
+
+
+# --- dwho recovered from the client's other applications ---------------------
+
+def test_issuer_recovered_from_other_application(cfg):
+    """The dominant quarantine reason: this application left dwho empty, but the
+    client stated it for the SAME document in another application."""
+    row = make_row(snap_passport_issued_by="", user_passport_number=None)
+    summary = EnrichSummary()
+    subject, reason = enrich_line(
+        make_line(), {"395397": row}, cfg, {77: [make_peer()]}, summary)
+
+    assert reason is None
+    assert subject["docs"][0]["dwho"] == "Луцьким РВ УМВС"
+    assert summary.lines_issuer_from_peer == 1
+
+
+def test_issuer_peer_must_match_the_document_number(cfg):
+    """An issuer belonging to a DIFFERENT passport must never be attached to this
+    one — we complete missing data, we never invent it."""
+    row = make_row(snap_passport_issued_by="", user_passport_number=None)
+    peer = make_peer(number="АБ123456")  # a different document of the same client
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg, {77: [peer]})
+
+    assert subject is None
+    assert "dwho" in reason
+
+
+def test_issuer_peer_lookup_ignores_other_clients(cfg):
+    row = make_row(snap_passport_issued_by="", user_passport_number=None)
+    subject, reason = enrich_line(
+        make_line(), {"395397": row}, cfg, {999: [make_peer(user_id=999)]})
+    assert subject is None
+    assert "dwho" in reason
+
+
+def test_issuer_peer_number_matching_normalizes_spacing_and_case(cfg):
+    row = make_row(snap_passport_issued_by="", user_passport_number=None)
+    peer = make_peer(number=" се 311111 ")
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg, {77: [peer]})
+    assert reason is None
+    assert subject["docs"][0]["dwho"] == "Луцьким РВ УМВС"
+
+
+def test_issuer_peer_also_supplies_missing_id_card_date(cfg):
+    """An ID card needs dterm (issue + 10y); without a date it was quarantined
+    even when the issuer was known, so the peer fills both."""
+    row = make_row(snap_passport_number="123456789", snap_passport_date=None,
+                   snap_passport_issued_by="", user_passport_number=None)
+    peer = make_peer(number="123456789", issued=date(2016, 3, 10))
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg, {77: [peer]})
+
+    assert reason is None
+    doc = subject["docs"][0]
+    assert (doc["dtype"], doc["dwdt"], doc["dterm"]) == ("17", "2016-03-10", "2026-03-10")
+
+
+def test_issuer_peer_newest_application_wins(cfg):
+    row = make_row(snap_passport_issued_by="", user_passport_number=None)
+    peers = [
+        make_peer(issuer="СТАРИЙ ВІДДІЛ", applied=datetime(2019, 1, 1)),
+        make_peer(issuer="НОВИЙ ВІДДІЛ", applied=datetime(2026, 2, 2)),
+    ]
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg, {77: peers})
+    assert reason is None
+    assert subject["docs"][0]["dwho"] == "НОВИЙ ВІДДІЛ"
+
+
+def test_own_issuer_wins_over_peer(cfg):
+    row = make_row()  # snapshot already has an issuer
+    peer = make_peer(issuer="НЕ ЦЕЙ ВІДДІЛ")
+    summary = EnrichSummary()
+    subject, reason = enrich_line(
+        make_line(), {"395397": row}, cfg, {77: [peer]}, summary)
+
+    assert reason is None
+    assert subject["docs"][0]["dwho"] == "Луцьким МВ УДМС"
+    assert summary.lines_issuer_from_peer == 0
+
+
+def test_peer_recovery_not_counted_when_line_fails_later(cfg):
+    row = make_row(snap_passport_issued_by="", user_passport_number=None,
+                   snap_phone="", user_phone="12345")  # no valid phone
+    summary = EnrichSummary()
+    subject, reason = enrich_line(
+        make_line(), {"395397": row}, cfg, {77: [make_peer()]}, summary)
+
+    assert subject is None and "phone" in reason
+    assert summary.lines_issuer_from_peer == 0
+
+
+def test_run_enrich_scopes_issuer_lookup_to_clients_missing_it(cfg):
+    write_jsonl(cfg.raw_folder, "a.jsonl", [
+        json.dumps(make_line(), ensure_ascii=False),
+        json.dumps(make_line(inn="2726020593", deals=[{"dlref": "999", "lng": 1}]),
+                   ensure_ascii=False),
+    ])
+    rows = {
+        "395397": make_row(),                                   # issuer present
+        "999": make_row(app_id=999, user_id=88, user_inn="2726020593",
+                        snap_passport_issued_by=""),            # issuer missing
+    }
+    calls: list[list[int]] = []
+    summary = run_enrich(cfg, fetch=fake_fetch(rows),
+                         fetch_issuers=fake_issuer_fetch({88: [make_peer(user_id=88)]}, calls))
+
+    assert calls == [[88]]  # the client that already has an issuer is never queried
+    assert (summary.lines_enriched, summary.lines_quarantined) == (2, 0)
+    assert summary.lines_issuer_from_peer == 1
+
+
+def test_run_enrich_skips_issuer_query_when_nothing_is_missing(cfg):
+    write_jsonl(cfg.raw_folder, "a.jsonl", [json.dumps(make_line(), ensure_ascii=False)])
+
+    def exploding_issuers(config, user_ids):
+        raise AssertionError("no client lacks an issuer, must not query")
+
+    summary = run_enrich(cfg, fetch=fake_fetch({"395397": make_row()}),
+                         fetch_issuers=exploding_issuers)
+    assert summary.lines_enriched == 1
 
 
 def test_inn_mismatch_quarantines(cfg):
@@ -286,7 +422,11 @@ def test_dry_run_touches_nothing(cfg):
     def exploding_fetch(config, dlrefs):
         raise AssertionError("dry-run must not query MySQL")
 
-    summary = run_enrich(cfg, fetch=exploding_fetch, dry_run=True)
+    def exploding_issuers(config, user_ids):
+        raise AssertionError("dry-run must not query MySQL")
+
+    summary = run_enrich(cfg, fetch=exploding_fetch, dry_run=True,
+                         fetch_issuers=exploding_issuers)
     assert summary.files_processed == 1
     assert summary.lines_total == 1
     assert (cfg.raw_folder / "a.jsonl").exists()

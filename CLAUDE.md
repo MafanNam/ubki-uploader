@@ -13,21 +13,11 @@ Daily push of credit data to UBKI (Ukrainian credit bureau), in two cron stages:
 
 ## Commands
 
-```bash
-.venv/bin/python -m pytest -q                          # full suite
-.venv/bin/python -m pytest tests/test_client.py -q     # one file
-.venv/bin/python -m pytest -k "test_abort" -q          # one test
+`make help` lists every target (tests, enrich, run, api, docker). What the Makefile does not tell you:
 
-python -m app.run_once --dry-run    # scan + report, zero DB writes, no sending
-python -m app.run_once              # one real pass (needs env vars, see .env.example)
-python -m app.enrich --dry-run      # scan raw folder + report, no MySQL, no writes
-python -m app.enrich                # enrich raw files (needs RAW_FOLDER + MYSQL_* env)
-
-uvicorn "app.api:create_app" --factory --port 8000     # API (factory pattern — not app.api:app)
-
-docker compose build
-docker compose up -d                # services: api (uvicorn) + scheduler (supercronic, 06:00 Kyiv)
-```
+- both real (non-`--dry-run`) pipeline stages need env vars: the uploader wants `.env` (see `.env.example`), the enricher additionally `RAW_FOLDER` + `MYSQL_*`.
+- `--dry-run` exists for both stages and writes nothing at all (no DB, no MySQL, no file moves) — use it to inspect a folder safely.
+- compose services: `api` (uvicorn) + `scheduler` (supercronic, 05:30 enrich / 06:00 upload Kyiv).
 
 Config comes **only from env vars** (`app/config.py`); tests construct `Config` dataclasses directly instead of monkeypatching env.
 
@@ -35,7 +25,7 @@ Config comes **only from env vars** (`app/config.py`); tests construct `Config` 
 
 Pipeline (`app/uploader.py: run_pass`): flock lock → scan folder → ingest new files → send records **concurrently** (bounded worker pool + rate cap) → archive completed files → write `runs` row → Telegram alert. Every record update commits its own transaction, so a crash mid-pass loses no progress.
 
-Enricher (`app/enricher.py: run_enrich`, own flock): scan `raw_folder` (same FILE_GLOB/mtime rules via `scan_folder(folder=...)`) → per file: parse lines, one batch MySQL query for all dlrefs (`fetch_deals_data`, injectable in tests) → `enrich_line` builds the subject from the NEWEST application's snapshot (`vdate` = `applied_at`, `users` fallback for passport/phone) → enriched file written atomically into the inbox, quarantined lines (`{"line_no","reason","line"}`) + raw file moved aside → `enriched_files` row (identity = filename+sha256, same idempotency pattern) → Telegram alert on quarantines/errors. Quarantine reasons that BLOCK a line: broken JSON, missing/unknown dlref, deals of different clients, **inn mismatch vs `users.social_number`** (never risk another person's credit history), unsupported passport format (2 letters+6 digits → dtype 1; 9 digits → dtype 17 sent WITHOUT eddr in v1), **empty document issuer `dwho`** (live-confirmed: the bureau drops such docs via IGNORED 3003 → CRITICAL 2077 rejects the package; ~20% of cabinet clients had it empty on the first mass run), no valid phone. Optional dictionary fields (csex/family/ceduc/…) are deliberately not sent in v1 — the id→UBKI-code mappings live in the OctoberCMS code, not in the DB.
+Enricher (`app/enricher.py: run_enrich`, own flock): scan `raw_folder` (same FILE_GLOB/mtime rules via `scan_folder(folder=...)`) → per file: parse lines, one batch MySQL query for all dlrefs (`fetch_deals_data`, injectable in tests) → a second, narrowly scoped query for clients whose fetched applications carry no document issuer (`fetch_passport_issuers`, also injectable; keep it scoped — the applications table averages ~19KB per row and the lookup columns are not covered by an index, so this is random-I/O bound. Cost is NOT reliably known: off-site sampling ranged 2–110ms per client depending on InnoDB cache state, so budget it from the `issuer_peer_lookup` log line of a real run and watch the 05:30→06:00 window; `peer_issuer_bench.py` measures it in place) → `enrich_line` builds the subject from the NEWEST application's snapshot (`vdate` = `applied_at`, `users` fallback for passport/phone) → enriched file written atomically into the inbox, quarantined lines (`{"line_no","reason","line"}`) + raw file moved aside → `enriched_files` row (identity = filename+sha256, same idempotency pattern) → Telegram alert on quarantines/errors. Quarantine reasons that BLOCK a line: broken JSON, missing/unknown dlref, deals of different clients, **inn mismatch vs `users.social_number`** (never risk another person's credit history), unsupported passport format (2 letters+6 digits → dtype 1; 9 digits → dtype 17 sent WITHOUT eddr in v1), **empty document issuer `dwho`** (live-confirmed: the bureau drops such docs via IGNORED 3003 → CRITICAL 2077 rejects the package; the single biggest quarantine reason — 97% of the 2026-08-14 file), no valid phone. Before quarantining on `dwho`, `build_doc` falls back to the client's OTHER applications (`_find_peer_document`) — live-DB sampling on 2026-08-18 recovered **27% of recent applications but only 8.5% of older ones**, and an id-range sample is not representative of a daily file's dlrefs, so treat `summary.lines_issuer_from_peer` from a real run as the only authoritative figure; the match is keyed on the **same document number** on purpose — an issuer from a different passport must never be attached to this one, so we complete missing data and never invent it. `summary.lines_issuer_from_peer` counts these recoveries (only for lines that fully enrich). Optional dictionary fields (csex/family/ceduc/…) are deliberately not sent in v1 — the id→UBKI-code mappings live in the OctoberCMS code, not in the DB.
 
 Key invariants that span multiple files:
 
@@ -64,3 +54,18 @@ UBKI protocol details (endpoints, envelope shape, wiki links, error codes) are d
 Fully confirmed end-to-end on `test.ubki.ua` (2026-07-15, seeded sessid): **`state=ok` received**, record `sent`, file archived. Validation rejections arrive as **HTTP 400** with `sentdatainfo.state=er` in the body (handled: body `state` wins over the HTTP code). The auth endpoint enforces an IP whitelist (error 278; `upload/data` itself does not) — seed a session with `python -m app.set_session <sessid>` when authing from a non-whitelisted IP.
 
 Data-side requirements discovered live (for the data producer): the line is the bare subject object (no `fo_cki` wrapper); all of `idents`/`docs`/`addrs`/`contacts` blocks are mandatory (2078/2077/2072/2074); contacts need a **valid phone** — made-up numbers are dropped (IGNORED 3013; on the test contour use the doc's official test numbers, e.g. `+380981220000`) and test-looking emails too (3017); deals older than the transmission window are dropped (IGNORED 3019); a new deal with a stale doc `vdate` warns (3022); the test base substitutes fake INNs and surnames (NOTICE 5009).
+
+## Deal status (`dlflstat`) and the final-status trap
+
+`deallife[].dlflstat` comes from UBKI dictionary 16 ([full table](https://wiki-ubki.atlassian.net/wiki/spaces/Spec/pages/111476837) — only the codes we need are repeated here). Write-offs have dedicated codes; do NOT flatten them to `2` (Закрито), which asserts the debt was fully repaid:
+
+- `1` Відкрито — the normal ongoing case.
+- `7` Списаний — bad debt written off against reserves. **Final only when the balance is 0**; while debt remains and payment is still expected it is NOT final, so the deal keeps being exported.
+- `12` Списаний (банкрутство) — debt forgiven because the person was declared bankrupt. **Always final, balance must be 0.**
+- `2` Закрито / `13` Закритий без погашення / `3` Проданий / `14` Відступлений — other final states, all requiring balance 0.
+
+**A deal sent in a final status must never be exported again**: UBKI answers repeat updates with CRITICAL `2090` ("Оновлення угод в кінцевому статусі не допускається") — 434 of these in the 2026-08-14 file, i.e. this is already happening. The producer, not this service, has to drop such deals from subsequent files.
+
+Two more constraints that these statuses trip (both live-confirmed as mass rejections): the zeroed amounts must be **consistent** — `dldayexp` and `dlamtexp` must be zero/non-zero together (`2051`, 1900 hits), and a closing status requires `dldff` (actual end date) **equal to the slice date** (`4012`/`2076` for a missing one, `2056` for a mismatched one).
+
+Bankruptcy also exists as `comp id="54"` in the credit REPORT — that is data UBKI returns from state registries, unrelated to what we transmit via `dlflstat`.

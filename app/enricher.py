@@ -15,9 +15,13 @@ Unlike the uploader (which must treat lines as opaque bytes), the enricher
 legitimately parses them. Identity blocks come from the NEWEST application's
 snapshot among the line's deals (`vdate` = applied_at) with `users` as
 fallback; deal fields pass through as-is, only missing mandatory `dlvidobes`
-is injected. A line is quarantined when: broken JSON, no/unknown dlref, deals
-of different clients, file inn != users.social_number (never risk writing
-someone else's credit history), unsupported passport format, no valid phone.
+is injected. The document issuer (`dwho`, de-facto mandatory) has a third
+source: when neither the snapshot nor `users` carries it, it is taken from
+another application of the SAME client that states an issuer for the SAME
+document number (see `_find_peer_document`). A line is quarantined when:
+broken JSON, no/unknown dlref, deals of different clients, file inn !=
+users.social_number (never risk writing someone else's credit history),
+unsupported passport format, no valid phone.
 Quarantine records are {"line_no", "reason", "line"}; drop the fixed file
 back into RAW_FOLDER to reprocess (the wrapper is recognized and unwrapped).
 
@@ -73,7 +77,22 @@ JOIN users u ON u.id = a.user_id
 WHERE a.id IN ({placeholders})
 """
 
+# Applications of a client that DO carry a document issuer — the fallback source
+# for lines whose own application left `passport_issued_by` empty. Only the few
+# columns needed to match the document and complete it.
+FETCH_ISSUERS_SQL = """
+SELECT user_id, passport_number, passport_issued_by, passport_date, applied_at
+FROM finplugs_creditup_applications
+WHERE user_id IN ({placeholders})
+  AND passport_issued_by IS NOT NULL AND passport_issued_by <> ''
+"""
+
+# user_ids per query: the applications table has ~19KB average rows, so this is
+# kept small deliberately — a wide IN list would read gigabytes off disk.
+ISSUER_CHUNK = 500
+
 Fetcher = Callable[[Config, list[str]], dict[str, dict]]
+IssuerFetcher = Callable[[Config, list[int]], dict[int, list[dict]]]
 
 
 @dataclass
@@ -86,6 +105,9 @@ class EnrichSummary:
     lines_total: int = 0
     lines_enriched: int = 0
     lines_quarantined: int = 0
+    # enriched lines whose `dwho` came from another application of the same
+    # client (would have been quarantined before)
+    lines_issuer_from_peer: int = 0
     quarantine_reasons: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -96,19 +118,24 @@ class EnrichSummary:
         }
 
 
-def fetch_deals_data(config: Config, dlrefs: list[str]) -> dict[str, dict]:
-    """One batch query per file; returns {dlref: row}. pymysql is imported
-    lazily so the api/uploader never need it at import time."""
+def _open_cabinet(config: Config):
+    """pymysql is imported lazily so the api/uploader never need it at import
+    time (only `app.enrich` talks to the cabinet)."""
     import pymysql
 
-    if not dlrefs:
-        return {}
-    conn = pymysql.connect(
+    return pymysql.connect(
         host=config.mysql_host, port=config.mysql_port,
         user=config.mysql_user, password=config.mysql_password,
         database=config.mysql_db, connect_timeout=10, charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
     )
+
+
+def fetch_deals_data(config: Config, dlrefs: list[str]) -> dict[str, dict]:
+    """One batch query per file; returns {dlref: row}."""
+    if not dlrefs:
+        return {}
+    conn = _open_cabinet(config)
     try:
         placeholders = ", ".join(["%s"] * len(dlrefs))
         with conn.cursor() as cur:
@@ -116,6 +143,27 @@ def fetch_deals_data(config: Config, dlrefs: list[str]) -> dict[str, dict]:
             return {str(row["id"]): row for row in cur.fetchall()}
     finally:
         conn.close()
+
+
+def fetch_passport_issuers(config: Config, user_ids: list[int]) -> dict[int, list[dict]]:
+    """Other applications of these clients that carry a document issuer, keyed by
+    user_id. Queried in chunks and only for the clients whose own application
+    left `dwho` empty, so the extra read stays proportional to the problem."""
+    if not user_ids:
+        return {}
+    out: dict[int, list[dict]] = {}
+    conn = _open_cabinet(config)
+    try:
+        with conn.cursor() as cur:
+            for start in range(0, len(user_ids), ISSUER_CHUNK):
+                chunk = user_ids[start:start + ISSUER_CHUNK]
+                placeholders = ", ".join(["%s"] * len(chunk))
+                cur.execute(FETCH_ISSUERS_SQL.format(placeholders=placeholders), chunk)
+                for row in cur.fetchall():
+                    out.setdefault(row["user_id"], []).append(row)
+    finally:
+        conn.close()
+    return out
 
 
 # --- pure building blocks --------------------------------------------------
@@ -169,18 +217,48 @@ def _plus_years(iso_day: str, years: int) -> str:
         return day.replace(year=day.year + years, day=28).isoformat()
 
 
-def build_doc(row: dict, vdate: str) -> tuple[dict | None, str | None]:
-    """docs[0] from the application snapshot, falling back to users.
+def _normalize_number(value) -> str:
+    """Passport numbers arrive with stray spaces and mixed case across sources."""
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def _find_peer_document(peers: list[dict] | None, number: str) -> dict | None:
+    """Issuer (and issue date) that the SAME client stated for the SAME document
+    number in another application. Matching on the number is what keeps this
+    factual: an issuer belonging to a different passport must never be attached
+    to this one — we complete missing data, we never invent it. The newest
+    application wins, so the ordering is enforced here instead of being trusted
+    from the fetcher."""
+    candidates = [
+        peer for peer in (peers or ())
+        if _normalize_number(peer.get("passport_number")) == number
+        and str(peer.get("passport_issued_by") or "").strip()
+    ]
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda peer: _sort_key(peer.get("applied_at")))
+    return {
+        "issuer": str(newest["passport_issued_by"]).strip(),
+        "issued_at": _iso_date(newest.get("passport_date")),
+    }
+
+
+def build_doc(row: dict, vdate: str, peers: list[dict] | None = None,
+              stats: dict | None = None) -> tuple[dict | None, str | None]:
+    """docs[0] from the application snapshot, falling back to users and then to
+    the client's other applications (`peers`, matched by document number).
     Format detection: 2 letters + 6 digits = passport book (dtype 1),
     9 digits = ID card (dtype 17, sent without eddr_number — the bureau never
     asked for it live). De-facto mandatory (live-confirmed IGNORED 3003 →
     CRITICAL 2077): `dwho` for every doc, `dterm` for ID cards. The cabinet
     has no expiry field, so dterm is derived as issue date + 10 years (the
-    statutory adult ID-card validity)."""
+    statutory adult ID-card validity). `stats` records whether a peer supplied
+    the issuer, so the caller can count recoveries only for lines that make it
+    all the way through."""
     saw_valid_number = False
     saw_idcard_without_date = False
     for prefix in ("snap", "user"):
-        number = re.sub(r"\s+", "", str(row.get(f"{prefix}_passport_number") or "")).upper()
+        number = _normalize_number(row.get(f"{prefix}_passport_number"))
         if not number:
             continue
         if re.fullmatch(r"\d{9}", number):
@@ -192,9 +270,18 @@ def build_doc(row: dict, vdate: str) -> tuple[dict | None, str | None]:
             continue  # unsupported format in this source; try the other one
         saw_valid_number = True
         issued_by = str(row.get(f"{prefix}_passport_issued_by") or "").strip()
-        if not issued_by:
-            continue  # bureau drops docs without an issuer; try the other source
         issued_at = _iso_date(row.get(f"{prefix}_passport_date"))
+        used_peer = False
+        if not issued_by:
+            # this application left the issuer empty, but the client stated it
+            # for the same document elsewhere — complete it from there instead
+            # of quarantining (the bureau drops docs without an issuer)
+            peer = _find_peer_document(peers, number)
+            if peer is None:
+                continue  # nothing to complete it with; try the other source
+            issued_by = peer["issuer"]
+            issued_at = issued_at or peer["issued_at"]
+            used_peer = True
         if dtype == DOC_TYPE_ID_CARD and not issued_at:
             saw_idcard_without_date = True
             continue  # dterm cannot be derived without the issue date
@@ -204,6 +291,8 @@ def build_doc(row: dict, vdate: str) -> tuple[dict | None, str | None]:
             doc["dwdt"] = issued_at
         if dtype == DOC_TYPE_ID_CARD:
             doc["dterm"] = _plus_years(issued_at, 10)
+        if used_peer and stats is not None:
+            stats["issuer_from_peer"] = True
         return doc, None
     if saw_idcard_without_date:
         return None, "ID-card has no issue date in the cabinet — dterm cannot be derived"
@@ -236,8 +325,12 @@ def unwrap_quarantine(obj):
     return obj
 
 
-def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config) -> tuple[dict | None, str | None]:
-    """Build the full fo_cki subject, or return (None, reason) for quarantine."""
+def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config,
+                issuer_peers: dict[int, list[dict]] | None = None,
+                summary: EnrichSummary | None = None) -> tuple[dict | None, str | None]:
+    """Build the full fo_cki subject, or return (None, reason) for quarantine.
+    `issuer_peers` (keyed by user_id) is the third `dwho` source; `summary`, when
+    given, counts lines whose document was completed from it."""
     inn = str(line_obj.get("inn") or "").strip()
     if not inn:
         return None, "line has no inn"
@@ -269,7 +362,9 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config) -> tuple[
     if vdate is None:
         return None, "application has no applied_at (vdate)"
 
-    doc, doc_reason = build_doc(newest, vdate)
+    doc_stats: dict = {}
+    doc, doc_reason = build_doc(
+        newest, vdate, (issuer_peers or {}).get(newest["user_id"]), doc_stats)
     if doc is None:
         return None, doc_reason
 
@@ -312,6 +407,10 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config) -> tuple[
         "deals": out_deals,
         "contacts": [{"vdate": vdate, "ctype": CONTACT_TYPE_MOBILE, "cval": phone}],
     }
+    # counted only here: a doc completed from a peer whose line still failed
+    # later (no phone, missing name) is not a recovery
+    if summary is not None and doc_stats.get("issuer_from_peer"):
+        summary.lines_issuer_from_peer += 1
     return subject, None
 
 
@@ -362,8 +461,19 @@ def _write_enriched(folder: Path, name: str, sha256: str, lines: list[str]) -> P
     return target
 
 
+def _clients_missing_issuer(rows: dict[str, dict]) -> list[int]:
+    """Clients whose fetched applications carry no document issuer in either
+    source — exactly the ones `build_doc` would need a peer application for."""
+    return sorted({
+        row["user_id"] for row in rows.values()
+        if not str(row.get("snap_passport_issued_by") or "").strip()
+        and not str(row.get("user_passport_issued_by") or "").strip()
+    })
+
+
 def process_file(conn: Connection, config: Config, path: Path,
-                 summary: EnrichSummary, fetch: Fetcher, dry_run: bool) -> None:
+                 summary: EnrichSummary, fetch: Fetcher, dry_run: bool,
+                 fetch_issuers: IssuerFetcher | None = None) -> None:
     sha = sha256_of(path)
     if db.get_enriched_by_identity(conn, path.name, sha):
         return  # already enriched (identity = filename + sha256)
@@ -400,12 +510,26 @@ def process_file(conn: Connection, config: Config, path: Path,
 
     rows = fetch(config, sorted(dlrefs)) if dlrefs else {}
 
+    # `dwho` is de-facto mandatory but a large share of applications leave it
+    # empty in both sources (the dominant quarantine reason). The same client
+    # often stated it in another application, so fetch those as a fallback —
+    # scoped to the affected clients only, since the applications table has
+    # ~19KB rows and a wider query would read gigabytes.
+    need_issuer = _clients_missing_issuer(rows)
+    peers: dict[int, list[dict]] = {}
+    if need_issuer:
+        peers = (fetch_issuers or fetch_passport_issuers)(config, need_issuer)
+        log.info("issuer peer lookup", extra={
+            "event": "issuer_peer_lookup", "file": path.name,
+            "clients_missing_issuer": len(need_issuer),
+            "clients_with_candidates": len(peers)})
+
     enriched: list[str] = []
     quarantined: list[dict] = []
     for line_no, raw, obj, parse_error in parsed:
         reason = parse_error
         if reason is None:
-            subject, reason = enrich_line(obj, rows, config)
+            subject, reason = enrich_line(obj, rows, config, peers, summary)
             if reason is None:
                 enriched.append(json.dumps(subject, ensure_ascii=False, separators=(",", ":")))
         if reason is not None:
@@ -479,9 +603,11 @@ def build_alert(summary: EnrichSummary) -> str | None:
     return "\n".join(lines)
 
 
-def run_enrich(config: Config, fetch: Fetcher | None = None, dry_run: bool = False) -> EnrichSummary:
+def run_enrich(config: Config, fetch: Fetcher | None = None, dry_run: bool = False,
+               fetch_issuers: IssuerFetcher | None = None) -> EnrichSummary:
     summary = EnrichSummary(dry_run=dry_run)
     fetch = fetch or fetch_deals_data
+    fetch_issuers = fetch_issuers or fetch_passport_issuers
     config.enrich_lock_path.parent.mkdir(parents=True, exist_ok=True)
     with config.enrich_lock_path.open("w") as lock_file:
         try:
@@ -503,7 +629,7 @@ def run_enrich(config: Config, fetch: Fetcher | None = None, dry_run: bool = Fal
                 "event": "enrich_start", "files_seen": len(paths), "dry_run": dry_run})
             for path in paths:
                 try:
-                    process_file(conn, config, path, summary, fetch, dry_run)
+                    process_file(conn, config, path, summary, fetch, dry_run, fetch_issuers)
                 except Exception as exc:
                     # one bad file must not abort the whole batch; record it and
                     # move on so the rest of the day's files still get enriched
