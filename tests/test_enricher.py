@@ -3,6 +3,8 @@
 import json
 import os
 import time
+
+import pytest
 from datetime import date, datetime
 
 from app import db
@@ -288,6 +290,18 @@ def test_inn_mismatch_quarantines(cfg):
     subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
     assert subject is None
     assert "inn mismatch" in reason
+
+
+@pytest.mark.parametrize("cabinet_inn", ["", None, "   "])
+def test_missing_cabinet_inn_is_reported_as_a_gap_not_a_mismatch(cfg, cabinet_inn):
+    """Live finding (2026-08-14 file): 165 of 174 "inn mismatch" quarantines were
+    really an EMPTY users.social_number. Both still block, but the operator must
+    be able to tell a cabinet data gap from an identity conflict."""
+    row = make_row(user_inn=cabinet_inn)
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
+    assert subject is None
+    assert "no inn" in reason and "social_number" in reason
+    assert "different inn" not in reason
 
 
 def test_unknown_dlref_quarantines(cfg):

@@ -356,6 +356,15 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config,
     newest = max(deal_rows, key=lambda row: _sort_key(row.get("applied_at")))
     user_inn = str(newest.get("user_inn") or "").strip()
     if user_inn != inn:
+        # Both cases block (we never write a credit history under an unverified
+        # tax id), but they are DIFFERENT problems and must not be reported as
+        # one: an empty `users.social_number` is a cabinet data gap — fill it and
+        # the line passes — while a populated-but-different inn is an identity
+        # conflict needing investigation. Measured on the 2026-08-14 file: 165 of
+        # 174 were the empty case, all of them mislabelled as "different inn".
+        if not user_inn:
+            return None, (f"cabinet client has no inn (users.social_number is empty),"
+                          f" file has {inn}")
         return None, f"inn mismatch: file has {inn}, cabinet client has different inn"
 
     vdate = _iso_date(newest.get("applied_at"))
