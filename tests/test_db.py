@@ -1,5 +1,7 @@
 """File status aggregation over record statuses."""
 
+import sqlite3
+
 import pytest
 
 from app import db
@@ -48,3 +50,29 @@ def test_completed_at_set_once_for_terminal_status(conn):
     assert first is not None
     db.recompute_file_status(conn, file_id)
     assert conn.execute("SELECT completed_at FROM files").fetchone()["completed_at"] == first
+
+
+def test_connect_migrates_a_db_created_before_warn_codes(tmp_path):
+    """Prod databases predate the column and `CREATE TABLE IF NOT EXISTS` never
+    touches an existing table, so `connect` must run the ADD COLUMN itself."""
+    path = tmp_path / "legacy.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE records (id INTEGER PRIMARY KEY, uuid TEXT, file_id INTEGER,"
+        " line_no INTEGER, raw_line TEXT, status TEXT, attempts INTEGER DEFAULT 0,"
+        " last_error TEXT, ubki_response TEXT, created_at TEXT, sent_at TEXT)"
+    )
+    legacy.execute(
+        "INSERT INTO records (id, status, attempts, created_at) VALUES (1, ?, 0, 'x')",
+        (PENDING,),
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = db.connect(path)
+    try:
+        assert "warn_codes" in {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+        db.update_record_result(conn, 1, SENT, warn_codes="IG:3021")
+        assert conn.execute("SELECT warn_codes FROM records").fetchone()[0] == "IG:3021"
+    finally:
+        conn.close()

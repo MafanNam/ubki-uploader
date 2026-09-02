@@ -7,7 +7,7 @@ import pytest
 from app import db
 from app.db import FAILED, PENDING, REJECTED, SENT
 from app.ubki_client import UploadResult
-from app.uploader import build_alert, run_pass
+from app.uploader import RunSummary, build_alert, run_pass
 
 from .conftest import (
     FakeClient,
@@ -223,6 +223,28 @@ def test_nt_state_counts_as_sent_with_warning(cfg):
     assert summary.records_sent == 1
     assert summary.records_warnings == 1
     assert record_statuses(cfg) == [SENT]
+
+
+def test_warning_codes_are_persisted_and_dropped_components_counted(cfg):
+    """The raw response holds the same codes, but only as an 8KB blob for the
+    last attempt — trending "how many docs did the bureau drop" needs a column."""
+    write_jsonl(cfg.data_folder, "a.jsonl", LINES[:1])
+    result = UploadResult(status=SENT, state="ok", http_status=200,
+                          response_text='{"state":"ok"}', has_warnings=True,
+                          warn_codes=("IG:3021", "NT:4015"), components_dropped=True)
+    summary = run_pass(cfg, client=FakeClient([result]))
+
+    assert (summary.records_sent, summary.records_components_dropped) == (1, 1)
+    with db.connect(cfg.db_path) as conn:
+        assert [row["warn_codes"] for row in conn.execute("SELECT warn_codes FROM records")] == [
+            "IG:3021,NT:4015"
+        ]
+
+
+def test_alert_names_dropped_components_separately(cfg):
+    summary = RunSummary(records_sent=10, records_warnings=3, records_components_dropped=2)
+    alert = build_alert(summary)
+    assert "IGNORED" in alert and "2" in alert
 
 
 def test_dry_run_sends_and_moves_nothing(cfg):

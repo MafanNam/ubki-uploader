@@ -207,6 +207,71 @@ def test_ig_counter_maps_to_sent_with_warning(cfg):
     assert result.has_warnings is True
 
 
+def test_saturating_notices_do_not_raise_the_warning_flag(cfg):
+    """4014 (csex) and 5001 (OK NEW) arrive on virtually every record — with
+    them counted, 61566 of 61566 accepted records were "with warnings" on the
+    2026-08-14 prod file and the flag told the operator nothing. The codes are
+    still recorded per record, they just stop ringing the bell."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return upload_response({"sentdatainfo": {
+            "state": "ok", "main_errcode": 0, "ok": 2, "nt": 2, "ig": 0, "er": 0, "sy": 0,
+            "items": [{"errtype": "NOTICE", "errcode": 4014, "msg": "csex"},
+                      {"errtype": "NOTICE", "errcode": 5001, "msg": "OK NEW"}],
+        }})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == SENT
+    assert result.has_warnings is False
+    assert result.components_dropped is False
+    assert result.warn_codes == ("NT:4014", "NT:5001")
+
+
+def test_ignored_item_flags_dropped_components(cfg):
+    """IGNORED = the package was accepted but a component was thrown away: the
+    only warning class that loses data, so it gets its own flag."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return upload_response({"sentdatainfo": {
+            "state": "ok", "main_errcode": 0, "ok": 2, "nt": 1, "ig": 1, "er": 0, "sy": 0,
+            "items": [{"tag": "DOC", "errtype": "IGNORED", "errcode": 3021, "msg": "other dwho"},
+                      {"errtype": "NOTICE", "errcode": 4014, "msg": "csex"}],
+        }})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == SENT
+    assert result.has_warnings is True      # 3021 is not benign
+    assert result.components_dropped is True
+    assert result.warn_codes == ("IG:3021", "NT:4014")
+
+
+def test_rejected_response_also_records_warning_codes(cfg):
+    """A rejection often carries the IGNORED/NOTICE items that explain it;
+    losing them would mean re-reading the raw response blob."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth"):
+            return httpx.Response(200, json=AUTH_OK)
+        return httpx.Response(400, json={"sentdatainfo": {
+            "state": "er", "main_errcode": 2091, "ok": 0, "nt": 1, "ig": 1, "er": 1, "sy": 0,
+            "items": [{"errtype": "CRITICAL", "errcode": 2091, "msg": "dldayexp"},
+                      {"errtype": "IGNORED", "errcode": 3020, "msg": "doc invalid"},
+                      {"errtype": "NOTICE", "errcode": 4015, "msg": "invalid passport"}],
+        }})
+
+    with make_client(cfg, handler) as client:
+        result = client.upload_record(RAW_LINE, "rid1")
+
+    assert result.status == REJECTED
+    assert result.warn_codes == ("IG:3020", "NT:4015")  # CRITICAL stays in last_error
+    assert result.components_dropped is True
+
+
 def test_rejection_error_includes_items_detail(cfg):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/auth"):

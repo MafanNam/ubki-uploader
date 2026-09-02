@@ -9,8 +9,8 @@ from datetime import date, datetime
 
 from app import db
 from app.enricher import (
-    EnrichSummary, _write_enriched, build_alert, enrich_line, normalize_phone,
-    run_enrich, unwrap_quarantine,
+    EnrichSummary, _clients_missing_issuer, _write_enriched, build_alert, enrich_line,
+    normalize_phone, run_enrich, unwrap_quarantine,
 )
 
 from .conftest import OLD_ENOUGH, write_jsonl
@@ -143,6 +143,56 @@ def test_unsupported_passport_quarantines(cfg):
     assert "passport" in reason
 
 
+def test_no_passport_number_is_reported_separately_from_a_bad_format(cfg):
+    """Two different problems: nothing to send vs a value we cannot parse."""
+    row = make_row(snap_passport_number="", user_passport_number=None)
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
+    assert subject is None
+    assert reason == ("no passport number in the cabinet"
+                      " (both the application snapshot and users are empty)")
+
+
+def test_csex_is_derived_from_the_inn(cfg):
+    """dir.1: 1=Чоловік, 2=Жінка, taken from the 9th digit (odd = male).
+    Without it the bureau attaches NOTICE 4014 to every record."""
+    subject, reason = enrich_line(make_line(), {"395397": make_row()}, cfg)
+    assert reason is None
+    assert subject["idents"][0]["csex"] == "1"  # 3418011570 -> 9th digit 7, odd
+
+    female_inn = "3418011560"  # same bdate prefix, 9th digit 6
+    row = make_row(user_inn=female_inn)
+    subject, reason = enrich_line(make_line(inn=female_inn), {"395397": row}, cfg)
+    assert reason is None
+    assert subject["idents"][0]["csex"] == "2"
+
+
+def test_csex_omitted_for_a_non_standard_inn(cfg):
+    """A 9-digit or otherwise odd tax id encodes nothing — send no csex rather
+    than a guess (the line itself still goes through)."""
+    odd_inn = "341801157"
+    row = make_row(user_inn=odd_inn)
+    subject, reason = enrich_line(make_line(inn=odd_inn), {"395397": row}, cfg)
+    assert reason is None
+    assert "csex" not in subject["idents"][0]
+
+
+def test_bdate_contradicting_the_inn_quarantines(cfg):
+    """The tax id encodes the birth date; a contradiction means one of them is
+    wrong (bureau: CRITICAL 2098) and must not reach a credit history."""
+    subject, reason = enrich_line(make_line(bdate="1990-01-01"), {"395397": make_row()}, cfg)
+    assert subject is None
+    assert reason == ("bdate 1990-01-01 contradicts the date encoded in inn"
+                      " 3418011570 (expected 1993-07-31)")
+
+
+def test_bdate_check_skips_formats_it_cannot_read(cfg):
+    """Policing the date format is not this check's job — a non-ISO bdate must
+    not be turned into a false identity conflict."""
+    subject, reason = enrich_line(make_line(bdate="31.07.1993"), {"395397": make_row()}, cfg)
+    assert reason is None
+    assert subject["idents"][0]["bdate"] == "31.07.1993"
+
+
 def test_empty_document_issuer_quarantines(cfg):
     """Live finding: the bureau drops docs without dwho (IGNORED 3003) and
     then rejects the package (2077) — block such lines locally instead."""
@@ -257,7 +307,9 @@ def test_peer_recovery_not_counted_when_line_fails_later(cfg):
 def test_run_enrich_scopes_issuer_lookup_to_clients_missing_it(cfg):
     write_jsonl(cfg.raw_folder, "a.jsonl", [
         json.dumps(make_line(), ensure_ascii=False),
-        json.dumps(make_line(inn="2726020593", deals=[{"dlref": "999", "lng": 1}]),
+        # a different client: bdate must match the date encoded in that inn
+        json.dumps(make_line(inn="2726020593", bdate="1974-08-20",
+                             deals=[{"dlref": "999", "lng": 1}]),
                    ensure_ascii=False),
     ])
     rows = {
@@ -283,6 +335,31 @@ def test_run_enrich_skips_issuer_query_when_nothing_is_missing(cfg):
     summary = run_enrich(cfg, fetch=fake_fetch({"395397": make_row()}),
                          fetch_issuers=exploding_issuers)
     assert summary.lines_enriched == 1
+
+
+def test_issuer_lookup_covers_an_issuer_stuck_on_an_unusable_number():
+    """The snapshot has a usable document but no issuer, while the issuer that
+    exists sits on a users row whose number cannot be parsed — build_doc would
+    quarantine such a line, so the peer lookup must still run for it."""
+    row = make_row(snap_passport_issued_by="",
+                   user_passport_number="123456", user_passport_issued_by="Луцьким РВ")
+    assert _clients_missing_issuer({"395397": row}) == [77]
+
+
+def test_issuer_lookup_skipped_when_a_source_can_build_the_doc():
+    """The users row alone is enough here, so the extra ~70ms/client query
+    (measured on prod) must not be spent."""
+    row = make_row(snap_passport_issued_by="",
+                   user_passport_number="АБ123456", user_passport_issued_by="Луцьким РВ")
+    assert _clients_missing_issuer({"395397": row}) == []
+
+
+def test_issuer_lookup_skipped_when_no_source_has_a_usable_number():
+    """Quarantined on the document format regardless of any issuer — querying
+    peers for these clients was pure waste."""
+    row = make_row(snap_passport_number="123456", snap_passport_issued_by="",
+                   user_passport_number=None, user_passport_issued_by=None)
+    assert _clients_missing_issuer({"395397": row}) == []
 
 
 def test_inn_mismatch_quarantines(cfg):
