@@ -44,6 +44,16 @@ SESSION_EXPIRED_ERRCODES = {"2014"}
 # stored into records.ubki_response; generous enough that a full sentdatainfo
 # with items[] survives intact (a truncated body no longer parses as JSON)
 RESPONSE_TEXT_LIMIT = 8192
+# NOTICE codes that arrive on virtually every accepted record and would drown
+# the warning signal: 5001 "OK NEW" (a new deal period was recorded — success
+# info) and 4014 (csex sanity check, which fired on 100% of records for as long
+# as csex was not sent at all). Measured on the 2026-08-14 prod file: with these
+# two counted, `has_warnings` was true for 61566 of 61566 accepted records, so
+# the operator could not see the 3273 records whose components were dropped.
+# Everything else — every IGNORED in particular — is worth an operator's eye.
+BENIGN_WARNING_CODES = {"4014", "5001"}
+# severity prefixes for records.warn_codes (compact, queryable with LIKE)
+WARN_PREFIX = {"IGNORED": "IG", "NOTICE": "NT"}
 
 
 class UbkiAuthError(Exception):
@@ -74,6 +84,15 @@ class UploadResult:
     # neither reset nor increment the consecutive-network-error streak.
     is_local_reject: bool = False
     has_warnings: bool = False
+    # non-blocking findings of the last attempt, e.g. ("IG:3021", "NT:4015"),
+    # persisted into records.warn_codes: the raw response holds the same data
+    # but only for the last attempt and only as an 8KB blob, which makes any
+    # "how many documents did the bureau drop this month" query a full scan.
+    warn_codes: tuple[str, ...] = ()
+    # at least one IGNORED item: the package was accepted but a component
+    # (usually the doc block) was thrown away — the only warning class where
+    # data is actually lost, so it gets its own counter and alert line.
+    components_dropped: bool = False
 
 
 def kyiv_today() -> str:
@@ -114,6 +133,29 @@ def _counter(info: dict, key: str) -> int:
         return int(info.get(key) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _warning_codes(info: dict) -> tuple[tuple[str, ...], bool]:
+    """(`warn_codes`, any IGNORED) from the non-blocking items of a response.
+    CRITICAL items are left out on purpose: they are the rejection reason and
+    already land in `last_error`."""
+    codes: set[str] = set()
+    dropped = False
+    items = info.get("items")
+    if not isinstance(items, list):
+        return (), False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        prefix = WARN_PREFIX.get(str(item.get("errtype") or "").upper())
+        if prefix is None:
+            continue
+        code = str(item.get("errcode") or "").strip()
+        if not code:
+            continue
+        codes.add(f"{prefix}:{code}")
+        dropped = dropped or prefix == "IG"
+    return tuple(sorted(codes)), dropped
 
 
 def _rejection_detail(info: dict) -> str:
@@ -349,6 +391,11 @@ class UbkiClient:
     @staticmethod
     def _map_state(info: dict, state: str | None, http_status: int, text: str) -> UploadResult:
         response_text = text[:RESPONSE_TEXT_LIMIT]
+        warn_codes, has_ignored_item = _warning_codes(info)
+        # the counter is authoritative for "something was thrown away": a body
+        # that reports ig>0 without a matching item must not silence the only
+        # signal that means actual data loss
+        components_dropped = has_ignored_item or _counter(info, "ig") > 0
 
         if state in ("ok", "nt"):
             er_count = _counter(info, "er")
@@ -359,17 +406,23 @@ class UbkiClient:
                     status=REJECTED, state=state, http_status=http_status,
                     response_text=response_text,
                     error=f"{error}: {detail}" if detail else error,
+                    warn_codes=warn_codes, components_dropped=components_dropped,
                 )
             # nt = component accepted with notices (seen live: state=ok with
             # nt>0 when the test base substituted the INN), ig = component
             # dropped but package accepted: both must reach the operator as
-            # warnings even when the overall state is "ok".
-            has_warnings = (
-                state == "nt" or _counter(info, "nt") > 0 or _counter(info, "ig") > 0
+            # warnings even when the overall state is "ok". Codes known to fire
+            # on every record are excluded so the signal stays readable; when
+            # the response carries no items[] at all, the counters are the only
+            # thing to go by and any nt/ig still raises the flag.
+            notable = {code.split(":", 1)[1] for code in warn_codes} - BENIGN_WARNING_CODES
+            has_warnings = bool(notable) or components_dropped or (
+                not warn_codes and (state == "nt" or _counter(info, "nt") > 0)
             )
             return UploadResult(
                 status=SENT, state=state, http_status=http_status,
                 response_text=response_text, has_warnings=has_warnings,
+                warn_codes=warn_codes, components_dropped=components_dropped,
             )
         if state == "er":
             detail = _rejection_detail(info)
@@ -378,6 +431,7 @@ class UbkiClient:
                 status=REJECTED, state=state, http_status=http_status,
                 response_text=response_text,
                 error=f"{error}: {detail}" if detail else error,
+                warn_codes=warn_codes, components_dropped=components_dropped,
             )
         if state == "sy":
             # SYSTEM errors: the wiki asks clients to back off while they

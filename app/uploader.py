@@ -62,6 +62,10 @@ class RunSummary:
     records_failed: int = 0
     records_rejected: int = 0
     records_warnings: int = 0
+    # accepted records where UBKI dropped a component (IGNORED): the package
+    # landed, but part of the data did not — the only warning class that means
+    # actual data loss, so it is alerted separately from records_warnings
+    records_components_dropped: int = 0
     files_archived: int = 0
     aborted: bool = False
     skipped_lock: bool = False
@@ -189,6 +193,7 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
         db.update_record_result(
             conn, record["id"], result.status,
             last_error=result.error, ubki_response=result.response_text,
+            warn_codes=",".join(result.warn_codes) or None,
             count_attempt=not result.is_network_error,
         )
         log.info(
@@ -208,6 +213,8 @@ def send_records(conn: Connection, config: Config, client: UbkiClient, summary: 
             summary.records_sent += 1
             if result.has_warnings:
                 summary.records_warnings += 1
+            if result.components_dropped:
+                summary.records_components_dropped += 1
         elif result.status == REJECTED:
             summary.records_rejected += 1
         else:
@@ -333,15 +340,19 @@ def archive_completed_files(conn: Connection, config: Config, summary: RunSummar
 
 def build_alert(summary: RunSummary) -> str | None:
     if not (summary.records_failed or summary.records_rejected or summary.records_warnings
-            or summary.files_skipped or summary.files_empty or summary.errors):
+            or summary.records_components_dropped or summary.files_skipped
+            or summary.files_empty or summary.errors):
         return None
     lines = ["UBKI uploader: проблеми за останній прохід"]
     if summary.records_failed:
         lines.append(f"failed: {summary.records_failed} (буде ретрай)")
     if summary.records_rejected:
         lines.append(f"rejected: {summary.records_rejected} (потрібен ручний розбір)")
+    if summary.records_components_dropped:
+        lines.append(f"прийнято, але бюро відкинуло компонент (IGNORED):"
+                     f" {summary.records_components_dropped} — дані втрачені")
     if summary.records_warnings:
-        lines.append(f"прийнято з зауваженнями (nt/ig): {summary.records_warnings}")
+        lines.append(f"прийнято з зауваженнями (крім типових): {summary.records_warnings}")
     if summary.files_skipped:
         lines.append(f"файлів у папці поза маскою FILE_GLOB: {summary.files_skipped}")
     if summary.files_empty:

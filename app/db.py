@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS records (
     attempts      INTEGER NOT NULL DEFAULT 0,
     last_error    TEXT,
     ubki_response TEXT,
+    -- non-blocking findings of the last attempt as "IG:3021,NT:4015": the same
+    -- data is inside ubki_response, but only as an 8KB blob, so trending
+    -- "how many docs did the bureau drop" would mean a full-table JSON scan
+    warn_codes    TEXT,
     created_at    TEXT NOT NULL,
     sent_at       TEXT
 );
@@ -77,8 +81,25 @@ CREATE TABLE IF NOT EXISTS enriched_files (
 """
 
 
+# Columns added after the first deployments. `CREATE TABLE IF NOT EXISTS` never
+# touches an existing table, so a live DB needs the explicit ADD COLUMN; SQLite
+# does it in O(1) without rewriting the file (which matters — prod is >2 GB).
+MIGRATIONS = (
+    ("records", "warn_codes", "ALTER TABLE records ADD COLUMN warn_codes TEXT"),
+)
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def apply_migrations(conn: sqlite3.Connection) -> None:
+    for table, column, statement in MIGRATIONS:
+        # index 1 = column name; works whether or not a row_factory is set
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(statement)
+    conn.commit()
 
 
 def connect(db_path: Path | str, *, ensure_schema: bool = True) -> sqlite3.Connection:
@@ -95,6 +116,7 @@ def connect(db_path: Path | str, *, ensure_schema: bool = True) -> sqlite3.Conne
     if ensure_schema:
         conn.executescript(SCHEMA)
         conn.commit()
+        apply_migrations(conn)
     return conn
 
 
@@ -176,6 +198,7 @@ def update_record_result(
     *,
     last_error: str | None = None,
     ubki_response: str | None = None,
+    warn_codes: str | None = None,
     count_attempt: bool = True,
 ) -> None:
     """count_attempt=False keeps `attempts` unchanged — used for network-like
@@ -183,8 +206,8 @@ def update_record_result(
     sent_at = utcnow() if status == SENT else None
     conn.execute(
         "UPDATE records SET status = ?, attempts = attempts + ?, last_error = ?,"
-        " ubki_response = ?, sent_at = ? WHERE id = ?",
-        (status, int(count_attempt), last_error, ubki_response, sent_at, record_id),
+        " ubki_response = ?, warn_codes = ?, sent_at = ? WHERE id = ?",
+        (status, int(count_attempt), last_error, ubki_response, warn_codes, sent_at, record_id),
     )
     conn.commit()
 
@@ -194,8 +217,8 @@ def reset_records(conn: sqlite3.Connection, *, file_id: int | None = None, recor
     assert (file_id is None) != (record_id is None)
     where, param = ("file_id", file_id) if file_id is not None else ("id", record_id)
     cur = conn.execute(
-        f"UPDATE records SET status = ?, attempts = 0, last_error = NULL WHERE {where} = ?"
-        " AND status IN (?, ?)",
+        f"UPDATE records SET status = ?, attempts = 0, last_error = NULL, warn_codes = NULL"
+        f" WHERE {where} = ? AND status IN (?, ?)",
         (PENDING, param, FAILED, REJECTED),
     )
     conn.commit()

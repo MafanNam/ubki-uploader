@@ -130,7 +130,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="file not found")
         records = conn.execute(
             "SELECT id, uuid, line_no, status, attempts, last_error, ubki_response,"
-            " created_at, sent_at FROM records WHERE file_id = ? ORDER BY line_no",
+            " warn_codes, created_at, sent_at FROM records WHERE file_id = ? ORDER BY line_no",
             (file_id,),
         ).fetchall()
         return {

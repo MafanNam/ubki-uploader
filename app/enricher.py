@@ -18,10 +18,13 @@ fallback; deal fields pass through as-is, only missing mandatory `dlvidobes`
 is injected. The document issuer (`dwho`, de-facto mandatory) has a third
 source: when neither the snapshot nor `users` carries it, it is taken from
 another application of the SAME client that states an issuer for the SAME
-document number (see `_find_peer_document`). A line is quarantined when:
-broken JSON, no/unknown dlref, deals of different clients, file inn !=
-users.social_number (never risk writing someone else's credit history),
-unsupported passport format, no valid phone.
+document number (see `_find_peer_document`). `csex` and the birth-date check
+are derived from the tax id itself (`_inn_sex` / `_inn_birthday`), which the
+cabinet cannot provide. A line is quarantined when: broken JSON, no/unknown
+dlref, deals of different clients, file inn != users.social_number, bdate
+contradicting the date encoded in the inn (never risk writing someone else's
+credit history), no passport number at all, unsupported passport format,
+missing document issuer, no valid phone.
 Quarantine records are {"line_no", "reason", "line"}; drop the fixed file
 back into RAW_FOLDER to reprocess (the wrapper is recognized and unwrapped).
 
@@ -37,7 +40,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Callable
@@ -55,6 +58,8 @@ CONTACT_TYPE_MOBILE = "3"     # dir.10
 LANG_UKRAINIAN = "1"          # dir.23
 DOC_TYPE_PASSPORT = "1"       # dir.7: passport book (2 letters + 6 digits)
 DOC_TYPE_ID_CARD = "17"       # dir.7: ID card (9 digits); eddr unknown in DB (v1 sends without)
+SEX_MALE = "1"                # dir.1
+SEX_FEMALE = "2"              # dir.1
 
 _QUARANTINE_KEYS = {"line_no", "reason", "line"}
 
@@ -177,6 +182,31 @@ def normalize_phone(value) -> str | None:
     return None
 
 
+def _inn_birthday(inn: str) -> str | None:
+    """Birth date encoded in a Ukrainian tax id: the first five digits are the
+    number of days since 1899-12-31. Returns None for anything that is not a
+    10-digit id. Verified against the 2026-08-14 prod file: the derived date
+    matched the producer's `bdate` on 63615 of 63644 lines (99.95%)."""
+    if not (inn.isdigit() and len(inn) == 10):
+        return None
+    try:
+        return (date(1899, 12, 31) + timedelta(days=int(inn[:5]))).isoformat()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _inn_sex(inn: str) -> str | None:
+    """`csex` (dir.1: 1=Чоловік, 2=Жінка) from the 9th digit of the tax id —
+    odd = male, even = female. Cross-checked against patronymic endings on the
+    2026-08-14 prod file: agreed on 62968 of 63069 lines (99.84%), the residue
+    being unusual patronymics rather than mismatched ids. The cabinet has no
+    usable sex column, and without csex UBKI attaches NOTICE 4014 to EVERY
+    record, which is what saturated the warning alert."""
+    if not (inn.isdigit() and len(inn) == 10):
+        return None
+    return SEX_MALE if int(inn[8]) % 2 else SEX_FEMALE
+
+
 def _iso_date(value) -> str | None:
     """MySQL drivers return date/datetime objects; quarantine formats we don't
     recognize — including calendar-invalid strings like MySQL's zero-date
@@ -222,6 +252,22 @@ def _normalize_number(value) -> str:
     return re.sub(r"\s+", "", str(value or "")).upper()
 
 
+def _parse_doc_number(value) -> tuple[str, str, str] | None:
+    """(dtype, dser, dnom) for a document number in a supported format, else
+    None: 9 digits = ID card (dir.7 code 17), 2 non-digits + 6 digits = passport
+    book (code 1). Shared by `build_doc` and `_clients_missing_issuer` so both
+    agree on what counts as a usable document."""
+    number = _normalize_number(value)
+    if not number:
+        return None
+    if re.fullmatch(r"\d{9}", number):
+        return DOC_TYPE_ID_CARD, "", number
+    if (len(number) == 8 and number[2:].isdigit()
+            and not any(ch.isdigit() for ch in number[:2])):
+        return DOC_TYPE_PASSPORT, number[:2], number[2:]
+    return None
+
+
 def _find_peer_document(peers: list[dict] | None, number: str) -> dict | None:
     """Issuer (and issue date) that the SAME client stated for the SAME document
     number in another application. Matching on the number is what keeps this
@@ -255,19 +301,18 @@ def build_doc(row: dict, vdate: str, peers: list[dict] | None = None,
     statutory adult ID-card validity). `stats` records whether a peer supplied
     the issuer, so the caller can count recoveries only for lines that make it
     all the way through."""
+    saw_any_number = False
     saw_valid_number = False
     saw_idcard_without_date = False
     for prefix in ("snap", "user"):
         number = _normalize_number(row.get(f"{prefix}_passport_number"))
         if not number:
             continue
-        if re.fullmatch(r"\d{9}", number):
-            dtype, dser, dnom = DOC_TYPE_ID_CARD, "", number
-        elif (len(number) == 8 and number[2:].isdigit()
-              and not any(ch.isdigit() for ch in number[:2])):
-            dtype, dser, dnom = DOC_TYPE_PASSPORT, number[:2], number[2:]
-        else:
+        saw_any_number = True
+        parsed = _parse_doc_number(number)
+        if parsed is None:
             continue  # unsupported format in this source; try the other one
+        dtype, dser, dnom = parsed
         saw_valid_number = True
         issued_by = str(row.get(f"{prefix}_passport_issued_by") or "").strip()
         issued_at = _iso_date(row.get(f"{prefix}_passport_date"))
@@ -298,7 +343,14 @@ def build_doc(row: dict, vdate: str, peers: list[dict] | None = None,
         return None, "ID-card has no issue date in the cabinet — dterm cannot be derived"
     if saw_valid_number:
         return None, "document issuer (dwho) is empty in the cabinet (bureau drops such docs, 3003)"
-    return None, "unsupported passport format (neither 2 letters + 6 digits nor 9 digits)"
+    if saw_any_number:
+        # a number exists but neither source could be parsed: this is a format
+        # question (extend the parser or fix the cabinet value), unlike the case
+        # below, which is a plain data gap — reporting both as "unsupported
+        # format" hid which of the two an operator was looking at
+        return None, "unsupported passport format (neither 2 letters + 6 digits nor 9 digits)"
+    return None, ("no passport number in the cabinet"
+                  " (both the application snapshot and users are empty)")
 
 
 def build_addr(row: dict, vdate: str) -> dict:
@@ -388,11 +440,28 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config,
         return None, "line is missing lname/fname/bdate"
     mname = str(line_obj.get("mname") or "").strip()
 
+    # The tax id encodes the birth date, so a contradiction means one of the two
+    # is wrong and we must not write it into someone's credit history — the same
+    # guardrail as the inn check above. The bureau catches it anyway (CRITICAL
+    # 2098 on 21 of the 29 contradicting lines of the 2026-08-14 file, the other
+    # 8 slipped through), and a quarantine record names both values instead.
+    # Only ISO dates are compared: a format we don't recognize would produce
+    # false positives, and it is not this check's job to police the format.
+    inn_bdate = _inn_birthday(inn)
+    if inn_bdate and re.fullmatch(r"\d{4}-\d{2}-\d{2}", bdate[:10]) and bdate[:10] != inn_bdate:
+        return None, (f"bdate {bdate} contradicts the date encoded in inn {inn}"
+                      f" (expected {inn_bdate})")
+
     ident = {"vdate": vdate, "lng": LANG_UKRAINIAN, "inn": inn,
              "lname": lname, "fname": fname}
     if mname:
         ident["mname"] = mname
     ident |= {"bdate": bdate, "cgrag": CITIZENSHIP_UKRAINE}
+    # csex is optional per the spec, but omitting it makes the bureau attach
+    # NOTICE 4014 to every single record (see _inn_sex)
+    csex = _inn_sex(inn)
+    if csex:
+        ident["csex"] = csex
 
     # deals pass through as-is; only the missing mandatory dlvidobes is injected
     out_deals = []
@@ -471,13 +540,28 @@ def _write_enriched(folder: Path, name: str, sha256: str, lines: list[str]) -> P
 
 
 def _clients_missing_issuer(rows: dict[str, dict]) -> list[int]:
-    """Clients whose fetched applications carry no document issuer in either
-    source — exactly the ones `build_doc` would need a peer application for."""
-    return sorted({
-        row["user_id"] for row in rows.values()
-        if not str(row.get("snap_passport_issued_by") or "").strip()
-        and not str(row.get("user_passport_issued_by") or "").strip()
-    })
+    """Clients `build_doc` would need a peer application for: some source
+    carries a document number in a supported format but no issuer, and no
+    source can build a complete document on its own.
+
+    Judging by the document format (instead of "both issuers are empty") closes
+    two holes at once: a client whose issuer sits only on a source with an
+    unusable number was never looked up although its other source needed one,
+    while clients with no usable number anywhere were looked up in vain — they
+    are quarantined on the format regardless of the issuer."""
+    need: set[int] = set()
+    for row in rows.values():
+        complete = missing_issuer = False
+        for prefix in ("snap", "user"):
+            if _parse_doc_number(row.get(f"{prefix}_passport_number")) is None:
+                continue
+            if str(row.get(f"{prefix}_passport_issued_by") or "").strip():
+                complete = True
+            else:
+                missing_issuer = True
+        if missing_issuer and not complete:
+            need.add(row["user_id"])
+    return sorted(need)
 
 
 def process_file(conn: Connection, config: Config, path: Path,
