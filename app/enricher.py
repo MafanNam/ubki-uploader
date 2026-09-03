@@ -15,16 +15,18 @@ Unlike the uploader (which must treat lines as opaque bytes), the enricher
 legitimately parses them. Identity blocks come from the NEWEST application's
 snapshot among the line's deals (`vdate` = applied_at) with `users` as
 fallback; deal fields pass through as-is, only missing mandatory `dlvidobes`
-is injected. The document issuer (`dwho`, de-facto mandatory) has a third
-source: when neither the snapshot nor `users` carries it, it is taken from
-another application of the SAME client that states an issuer for the SAME
-document number (see `_find_peer_document`). `csex` and the birth-date check
-are derived from the tax id itself (`_inn_sex` / `_inn_birthday`), which the
-cabinet cannot provide. A line is quarantined when: broken JSON, no/unknown
-dlref, deals of different clients, file inn != users.social_number, bdate
+is injected. The document issuer (`dwho`) has a third source: when neither the
+snapshot nor `users` carries it, it is taken from another application of the
+SAME client that states an issuer for the SAME document number (see
+`_find_peer_document`); if that fails too, the document is sent incomplete
+(the bureau drops it and keeps the deal data — see `build_doc`) and counted in
+`summary.lines_doc_incomplete`. `csex` and the birth-date check are derived
+from the tax id itself (`_inn_sex` / `_inn_birthday`), which the cabinet
+cannot provide. A line is quarantined when: broken JSON, no/unknown dlref,
+deals of different clients, file inn != users.social_number, bdate
 contradicting the date encoded in the inn (never risk writing someone else's
 credit history), no passport number at all, unsupported passport format,
-missing document issuer, no valid phone.
+no valid phone.
 Quarantine records are {"line_no", "reason", "line"}; drop the fixed file
 back into RAW_FOLDER to reprocess (the wrapper is recognized and unwrapped).
 
@@ -113,6 +115,11 @@ class EnrichSummary:
     # enriched lines whose `dwho` came from another application of the same
     # client (would have been quarantined before)
     lines_issuer_from_peer: int = 0
+    # enriched lines whose document went out INCOMPLETE (no `dwho` and/or no
+    # `dwdt`): the bureau drops such a doc (IGNORED 3003) but records the deal
+    # data, which is why these are sent instead of quarantined. Counted here
+    # because that is the only remaining visibility into the cabinet gap.
+    lines_doc_incomplete: int = 0
     quarantine_reasons: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -289,21 +296,46 @@ def _find_peer_document(peers: list[dict] | None, number: str) -> dict | None:
     }
 
 
+def _doc_fields(vdate: str, dtype: str, dser: str, dnom: str,
+                issued_by: str, issued_at: str | None) -> dict:
+    """One `docs[]` entry from whatever the cabinet actually has. Empty fields
+    are omitted rather than sent blank — the bureau treats the two identically
+    (a missing key answers with the same IGNORED 3003 as an empty value), and
+    omitting keeps us from asserting a fact we do not hold."""
+    doc = {"vdate": vdate, "lng": LANG_UKRAINIAN,
+           "dtype": dtype, "dser": dser, "dnom": dnom}
+    if issued_by:
+        doc["dwho"] = issued_by
+    if issued_at:
+        doc["dwdt"] = issued_at
+        if dtype == DOC_TYPE_ID_CARD:
+            # the cabinet has no expiry field, so dterm is derived as issue
+            # date + 10 years (the statutory adult ID-card validity)
+            doc["dterm"] = _plus_years(issued_at, 10)
+    return doc
+
+
 def build_doc(row: dict, vdate: str, peers: list[dict] | None = None,
               stats: dict | None = None) -> tuple[dict | None, str | None]:
     """docs[0] from the application snapshot, falling back to users and then to
     the client's other applications (`peers`, matched by document number).
     Format detection: 2 letters + 6 digits = passport book (dtype 1),
     9 digits = ID card (dtype 17, sent without eddr_number — the bureau never
-    asked for it live). De-facto mandatory (live-confirmed IGNORED 3003 →
-    CRITICAL 2077): `dwho` for every doc, `dterm` for ID cards. The cabinet
-    has no expiry field, so dterm is derived as issue date + 10 years (the
-    statutory adult ID-card validity). `stats` records whether a peer supplied
-    the issuer, so the caller can count recoveries only for lines that make it
-    all the way through."""
+    asked for it live).
+
+    A document is COMPLETE when it carries both an issuer (`dwho`) and an issue
+    date (`dwdt`); anything less the bureau throws away with IGNORED 3003, so a
+    source holding both is always preferred over one holding part.
+
+    An incomplete document is still emitted, NOT quarantined. Measured on prod
+    2026-09-03 (`probe_dwho.py`, 300 of the 7373 issuer-less lines): none of
+    them drew 2077, i.e. the bureau already holds a document for that whole
+    cohort, so a package without an issuer is accepted with the doc merely
+    dropped — and blocking those lines locally threw away deliverable deal data
+    for nothing. `stats` records which path was taken so the caller can count
+    peer recoveries and dropped-doc lines only for lines that fully enrich."""
+    partial: dict | None = None  # best doc we can emit; the bureau will drop it
     saw_any_number = False
-    saw_valid_number = False
-    saw_idcard_without_date = False
     for prefix in ("snap", "user"):
         number = _normalize_number(row.get(f"{prefix}_passport_number"))
         if not number:
@@ -313,36 +345,33 @@ def build_doc(row: dict, vdate: str, peers: list[dict] | None = None,
         if parsed is None:
             continue  # unsupported format in this source; try the other one
         dtype, dser, dnom = parsed
-        saw_valid_number = True
         issued_by = str(row.get(f"{prefix}_passport_issued_by") or "").strip()
         issued_at = _iso_date(row.get(f"{prefix}_passport_date"))
         used_peer = False
         if not issued_by:
             # this application left the issuer empty, but the client stated it
-            # for the same document elsewhere — complete it from there instead
-            # of quarantining (the bureau drops docs without an issuer)
+            # for the same document elsewhere — complete it from there
             peer = _find_peer_document(peers, number)
-            if peer is None:
-                continue  # nothing to complete it with; try the other source
-            issued_by = peer["issuer"]
-            issued_at = issued_at or peer["issued_at"]
-            used_peer = True
-        if dtype == DOC_TYPE_ID_CARD and not issued_at:
-            saw_idcard_without_date = True
-            continue  # dterm cannot be derived without the issue date
-        doc = {"vdate": vdate, "lng": LANG_UKRAINIAN, "dtype": dtype, "dser": dser,
-               "dnom": dnom, "dwho": issued_by}
-        if issued_at:
-            doc["dwdt"] = issued_at
-        if dtype == DOC_TYPE_ID_CARD:
-            doc["dterm"] = _plus_years(issued_at, 10)
+            if peer is not None:
+                issued_by = peer["issuer"]
+                issued_at = issued_at or peer["issued_at"]
+                used_peer = True
+        doc = _doc_fields(vdate, dtype, dser, dnom, issued_by, issued_at)
+        if not (issued_by and issued_at):
+            # keep the snapshot's partial over users' one, and keep looking:
+            # the other source may still hold a complete document. A peer that
+            # supplied an issuer but no date lands here too — the bureau drops
+            # that doc all the same, so it is counted as dropped, not as a
+            # recovery, to keep `lines_issuer_from_peer` honest.
+            partial = partial or doc
+            continue
         if used_peer and stats is not None:
             stats["issuer_from_peer"] = True
         return doc, None
-    if saw_idcard_without_date:
-        return None, "ID-card has no issue date in the cabinet — dterm cannot be derived"
-    if saw_valid_number:
-        return None, "document issuer (dwho) is empty in the cabinet (bureau drops such docs, 3003)"
+    if partial is not None:
+        if stats is not None:
+            stats["doc_incomplete"] = True
+        return partial, None
     if saw_any_number:
         # a number exists but neither source could be parsed: this is a format
         # question (extend the parser or fix the cabinet value), unlike the case
@@ -489,6 +518,8 @@ def enrich_line(line_obj: dict, rows: dict[str, dict], config: Config,
     # later (no phone, missing name) is not a recovery
     if summary is not None and doc_stats.get("issuer_from_peer"):
         summary.lines_issuer_from_peer += 1
+    if summary is not None and doc_stats.get("doc_incomplete"):
+        summary.lines_doc_incomplete += 1
     return subject, None
 
 
@@ -542,7 +573,8 @@ def _write_enriched(folder: Path, name: str, sha256: str, lines: list[str]) -> P
 def _clients_missing_issuer(rows: dict[str, dict]) -> list[int]:
     """Clients `build_doc` would need a peer application for: some source
     carries a document number in a supported format but no issuer, and no
-    source can build a complete document on its own.
+    source carries one on its own (a peer can only supply an issuer, so a
+    source that already has one is past this lookup).
 
     Judging by the document format (instead of "both issuers are empty") closes
     two holes at once: a client whose issuer sits only on a source with an
@@ -603,9 +635,9 @@ def process_file(conn: Connection, config: Config, path: Path,
 
     rows = fetch(config, sorted(dlrefs)) if dlrefs else {}
 
-    # `dwho` is de-facto mandatory but a large share of applications leave it
-    # empty in both sources (the dominant quarantine reason). The same client
-    # often stated it in another application, so fetch those as a fallback —
+    # a large share of applications leave `dwho` empty in both sources (the
+    # cabinet stopped collecting it in 2020). The same client sometimes stated
+    # it in another application, so fetch those as a fallback —
     # scoped to the affected clients only, since the applications table has
     # ~19KB rows and a wider query would read gigabytes.
     need_issuer = _clients_missing_issuer(rows)
@@ -679,7 +711,8 @@ def process_file(conn: Connection, config: Config, path: Path,
 
 def build_alert(summary: EnrichSummary) -> str | None:
     if not (summary.lines_quarantined or summary.files_skipped
-            or summary.files_empty or summary.errors):
+            or summary.files_empty or summary.errors
+            or summary.lines_doc_incomplete):
         return None
     lines = ["UBKI enricher: проблеми при збагаченні"]
     if summary.lines_quarantined:
@@ -687,6 +720,9 @@ def build_alert(summary: EnrichSummary) -> str | None:
         lines.extend(summary.quarantine_reasons[:5])
         if len(summary.quarantine_reasons) > 5:
             lines.append(f"… та ще {len(summary.quarantine_reasons) - 5}")
+    if summary.lines_doc_incomplete:
+        lines.append("документ без видавця/дати видачі (бюро його відкине, дані угоди"
+                     f" дійдуть): {summary.lines_doc_incomplete} рядк.")
     if summary.files_skipped:
         lines.append(f"файлів у папці поза маскою FILE_GLOB: {summary.files_skipped}")
     if summary.files_empty:
