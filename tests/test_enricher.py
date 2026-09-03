@@ -117,12 +117,20 @@ def test_id_card_is_dtype_17_with_derived_dterm(cfg):
     assert doc["dterm"] == "2024-10-01"
 
 
-def test_id_card_without_issue_date_quarantines(cfg):
+def test_id_card_without_issue_date_goes_out_without_dterm(cfg):
+    """dterm cannot be derived without an issue date, so the doc is incomplete
+    and the bureau will drop it — but the deal data still has to reach UBKI,
+    so the line is sent and counted instead of quarantined."""
     row = make_row(snap_passport_number="123456789", snap_passport_date=None,
                    user_passport_number=None)
-    subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
-    assert subject is None
-    assert "dterm" in reason
+    summary = EnrichSummary()
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg, None, summary)
+
+    assert reason is None
+    doc = subject["docs"][0]
+    assert (doc["dtype"], doc["dnom"], doc["dwho"]) == ("17", "123456789", "Луцьким МВ УДМС")
+    assert "dwdt" not in doc and "dterm" not in doc
+    assert summary.lines_doc_incomplete == 1
 
 
 def test_passport_falls_back_to_users_row(cfg):
@@ -193,13 +201,47 @@ def test_bdate_check_skips_formats_it_cannot_read(cfg):
     assert subject["idents"][0]["bdate"] == "31.07.1993"
 
 
-def test_empty_document_issuer_quarantines(cfg):
-    """Live finding: the bureau drops docs without dwho (IGNORED 3003) and
-    then rejects the package (2077) — block such lines locally instead."""
+def test_empty_document_issuer_is_sent_without_dwho(cfg):
+    """Measured on prod 2026-09-03: none of 300 issuer-less lines drew 2077 —
+    the bureau holds a document for that cohort already, drops ours with
+    IGNORED 3003 and records the deals. So the doc goes out without `dwho`
+    (the key omitted, never blank) rather than the line being quarantined."""
     row = make_row(snap_passport_issued_by="", user_passport_number=None)
-    subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
-    assert subject is None
-    assert "dwho" in reason
+    summary = EnrichSummary()
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg, None, summary)
+
+    assert reason is None
+    doc = subject["docs"][0]
+    assert "dwho" not in doc
+    assert (doc["dtype"], doc["dser"], doc["dnom"]) == ("1", "СЕ", "311111")
+    assert doc["dwdt"] == "2014-10-01"  # everything we do have is still sent
+    assert summary.lines_doc_incomplete == 1
+
+
+def test_complete_source_wins_over_an_incomplete_one(cfg):
+    """A doc missing `dwdt` is thrown away by the bureau just like one missing
+    `dwho`, so a source carrying both beats the snapshot's partial document."""
+    row = make_row(snap_passport_date=None,                 # snapshot: issuer, no date
+                   user_passport_number="123456789",        # users: both
+                   user_passport_issued_by="8888",
+                   user_passport_date=date(2020, 2, 29))
+    summary = EnrichSummary()
+    subject, reason = enrich_line(make_line(), {"395397": row}, cfg, None, summary)
+
+    assert reason is None
+    doc = subject["docs"][0]
+    assert (doc["dtype"], doc["dnom"], doc["dwho"], doc["dwdt"]) == (
+        "17", "123456789", "8888", "2020-02-29")
+    assert summary.lines_doc_incomplete == 0
+
+
+def test_alert_reports_documents_the_bureau_will_drop(cfg):
+    """Sending incomplete docs instead of quarantining them removes the only
+    signal about the cabinet gap, so the summary counter must reach the alert
+    even when nothing was quarantined at all."""
+    alert = build_alert(EnrichSummary(lines_enriched=10, lines_doc_incomplete=7))
+    assert alert is not None
+    assert "7" in alert and "видавця" in alert
 
 
 def test_issuer_fallback_to_users_doc(cfg):
@@ -237,16 +279,16 @@ def test_issuer_peer_must_match_the_document_number(cfg):
     peer = make_peer(number="АБ123456")  # a different document of the same client
     subject, reason = enrich_line(make_line(), {"395397": row}, cfg, {77: [peer]})
 
-    assert subject is None
-    assert "dwho" in reason
+    assert reason is None
+    assert "dwho" not in subject["docs"][0]
 
 
 def test_issuer_peer_lookup_ignores_other_clients(cfg):
     row = make_row(snap_passport_issued_by="", user_passport_number=None)
     subject, reason = enrich_line(
         make_line(), {"395397": row}, cfg, {999: [make_peer(user_id=999)]})
-    assert subject is None
-    assert "dwho" in reason
+    assert reason is None
+    assert "dwho" not in subject["docs"][0]
 
 
 def test_issuer_peer_number_matching_normalizes_spacing_and_case(cfg):
@@ -551,14 +593,16 @@ def test_alert_none_when_clean():
 
 # --- calendar-invalid dates (must not crash the whole run) --------------------
 
-def test_id_card_zero_date_string_quarantines_not_crashes(cfg):
+def test_id_card_zero_date_string_does_not_crash(cfg):
     # MySQL zero-date returned as a string: regex-valid but not a real date.
-    # Must quarantine gracefully, not raise from _plus_years and abort the batch.
+    # Must be dropped gracefully, not raise from _plus_years and abort the batch.
     row = make_row(snap_passport_number="123456789", snap_passport_date="0000-00-00",
                    user_passport_number=None)
     subject, reason = enrich_line(make_line(), {"395397": row}, cfg)
-    assert subject is None
-    assert "dterm" in reason
+
+    assert reason is None
+    doc = subject["docs"][0]
+    assert "dwdt" not in doc and "dterm" not in doc
 
 
 def test_invalid_string_date_omitted_not_sent_as_garbage(cfg):
