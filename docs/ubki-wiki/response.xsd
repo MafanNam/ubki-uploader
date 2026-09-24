@@ -1,0 +1,84 @@
+<xs:schema elementFormDefault="qualified" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:element name="doc">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="tech">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="trace">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="step" maxOccurs="unbounded" >
+                                            <xs:complexType>
+                                                <xs:simpleContent>
+                                                    <xs:extension base="xs:string">
+                                                        <xs:attribute type="xs:string" name="name" />
+                                                        <xs:attribute type="xs:float" name="stm" />
+                                                        <xs:attribute type="xs:float" name="ftm" />
+                                                        <xs:attribute type="xs:string" name="start" />
+                                                        <xs:attribute type="xs:string" name="finish" />
+                                                        <xs:attribute type="xs:string" name="duration" />
+                                                    </xs:extension>
+                                                </xs:simpleContent>
+                                            </xs:complexType>
+                                        </xs:element>
+                                    </xs:sequence>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="reqinfo">
+                                <xs:complexType>
+                                    <xs:simpleContent>
+                                        <xs:extension base="xs:string">
+                                            <xs:attribute type="xs:string" name="reqid"/>
+                                        </xs:extension>
+                                    </xs:simpleContent>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="error">
+                                <xs:complexType>
+                                    <xs:simpleContent>
+                                        <xs:extension base="xs:string">
+                                            <xs:attribute type="xs:byte" name="errtype"/>
+                                            <xs:attribute type="xs:string" name="errtext"/>
+                                        </xs:extension>
+                                    </xs:simpleContent>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="sentdatainfo">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="item" maxOccurs="unbounded" minOccurs="0">
+                                            <xs:complexType>
+                                                <xs:simpleContent>
+                                                    <xs:extension base="xs:string">
+                                                        <xs:attribute type="xs:byte" name="compid" />
+                                                        <xs:attribute type="xs:string" name="tag" />
+                                                        <xs:attribute type="xs:string" name="attr" />
+                                                        <xs:attribute type="xs:string" name="code" />
+                                                        <xs:attribute type="xs:string" name="msg" />
+                                                        <xs:attribute type="xs:string" name="ok" />
+                                                        <xs:attribute type="xs:string" name="er" />
+                                                    </xs:extension>
+                                                </xs:simpleContent>
+                                            </xs:complexType>
+                                        </xs:element>
+                                    </xs:sequence>
+                                    <xs:attribute type="xs:string" name="reqid"/>
+                                    <xs:attribute type="xs:string" name="inn"/>
+                                    <xs:attribute type="xs:string" name="reqidout"/>
+                                    <xs:attribute type="xs:string" name="state"/>
+                                    <xs:attribute type="xs:string" name="errtype"/>
+                                    <xs:attribute type="xs:int" name="ok"/>
+                                    <xs:attribute type="xs:int" name="nt"/>
+                                    <xs:attribute type="xs:int" name="ig"/>
+                                    <xs:attribute type="xs:int" name="er"/>
+                                    <xs:attribute type="xs:int" name="sy"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+</xs:schema>
