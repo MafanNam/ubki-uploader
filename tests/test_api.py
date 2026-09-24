@@ -79,12 +79,47 @@ def test_health_degraded_when_run_older_than_25h(api, cfg):
     assert body["status"] == "degraded"
 
 
-def test_health_degraded_on_rejected_records(api, cfg):
+def test_health_degraded_on_a_high_share_of_recent_rejections(api, cfg):
     seed_run(cfg, iso(datetime.now(timezone.utc)))
     seed_file(cfg, [SENT, REJECTED])
     body = api.get("/health").json()
     assert body["status"] == "degraded"
-    assert any("rejected" in reason for reason in body["reasons"])
+    assert any("were rejected (50.0% > 2.0%)" in reason for reason in body["reasons"])
+    assert body["recent_rejections"] == {"window_days": 14, "rejected": 1, "total": 2,
+                                         "ratio": 0.5, "max_ratio": 0.02}
+
+
+def test_health_ok_when_recent_rejections_stay_under_the_threshold(api, cfg):
+    # the everyday case: every producer file carries ~0.3% bureau rejections
+    seed_run(cfg, iso(datetime.now(timezone.utc)))
+    seed_file(cfg, [REJECTED] + [SENT] * 99)
+    body = api.get("/health").json()
+    assert body["status"] == "ok", body["reasons"]
+    assert body["recent_rejections"]["ratio"] == 0.01
+    assert body["record_counts"] == {SENT: 99, REJECTED: 1}   # still visible
+
+
+def test_health_ignores_rejections_of_files_outside_the_window(api, cfg):
+    # an old file resent later leaves its rejections behind as history
+    seed_run(cfg, iso(datetime.now(timezone.utc)))
+    file_id = seed_file(cfg, [REJECTED] * 10)
+    conn = db.connect(cfg.db_path)
+    old = iso(datetime.now(timezone.utc) - timedelta(days=cfg.health_rejected_window_days + 1))
+    conn.execute("UPDATE files SET created_at = ? WHERE id = ?", (old, file_id))
+    conn.commit()
+    conn.close()
+    body = api.get("/health").json()
+    assert body["status"] == "ok", body["reasons"]
+    assert body["recent_rejections"]["total"] == 0
+
+
+def test_health_threshold_is_configurable(cfg):
+    from dataclasses import replace
+
+    seed_run(cfg, iso(datetime.now(timezone.utc)))
+    seed_file(cfg, [REJECTED] + [SENT] * 99)
+    with TestClient(create_app(replace(cfg, health_rejected_max_ratio=0.005))) as client:
+        assert client.get("/health").json()["status"] == "degraded"
 
 
 def test_health_degraded_on_failed_over_cap(api, cfg):

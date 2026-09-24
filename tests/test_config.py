@@ -13,7 +13,8 @@ from app.config import load_config
 def _base_env(monkeypatch, tmp_path) -> None:
     for key in ("UBKI_URL", "UBKI_AUTH_URL", "DB_PATH", "RETRY_CAP",
                 "MIN_FILE_AGE_SEC", "MYSQL_PORT", "FILE_GLOB",
-                "NETWORK_ABORT_THRESHOLD"):
+                "NETWORK_ABORT_THRESHOLD", "HEALTH_REJECTED_WINDOW_DAYS",
+                "HEALTH_REJECTED_MAX_RATIO"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("UBKI_DATA_FOLDER_PATH", str(tmp_path / "inbox"))
     monkeypatch.setenv("UBKI_LOGIN", "login")
@@ -47,3 +48,13 @@ def test_numeric_env_is_parsed_when_set(monkeypatch, tmp_path):
     config = load_config()
     assert (config.retry_cap, config.min_file_age_sec, config.mysql_port) == (9, 42, 3307)
     assert config.network_abort_threshold == 30
+
+
+def test_health_rejection_thresholds_from_env(monkeypatch, tmp_path):
+    _base_env(monkeypatch, tmp_path)
+    config = load_config()
+    assert (config.health_rejected_window_days, config.health_rejected_max_ratio) == (14, 0.02)
+    monkeypatch.setenv("HEALTH_REJECTED_WINDOW_DAYS", "30")
+    monkeypatch.setenv("HEALTH_REJECTED_MAX_RATIO", "0.05")
+    config = load_config()
+    assert (config.health_rejected_window_days, config.health_rejected_max_ratio) == (30, 0.05)
