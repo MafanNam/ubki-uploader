@@ -80,11 +80,29 @@ def create_app(config: Config | None = None) -> FastAPI:
         if failed_over_cap:
             reasons.append(f"{failed_over_cap} record(s) failed beyond retry cap")
 
-        rejected = conn.execute(
-            "SELECT COUNT(*) AS n FROM records WHERE status = ?", (db.REJECTED,)
+        # share of rejections among the records ingested in the window. Counted
+        # per record, never by parsing the line (the service does not read file
+        # contents, so "is this deal's newest attempt rejected" is not ours to
+        # answer). Both halves avoid scanning `records` — the healthcheck calls
+        # this every minute and the table is gigabytes: the base is the files'
+        # own line counts, the rejections come off the status index.
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=config.health_rejected_window_days)).isoformat(timespec="seconds")
+        total = conn.execute(
+            "SELECT COALESCE(SUM(lines_total), 0) AS n FROM files WHERE created_at >= ?", (cutoff,)
         ).fetchone()["n"]
-        if rejected:
-            reasons.append(f"{rejected} rejected record(s) awaiting manual review")
+        recent_rejected = conn.execute(
+            "SELECT COUNT(*) AS n FROM records WHERE status = ?"
+            " AND file_id IN (SELECT id FROM files WHERE created_at >= ?)",
+            (db.REJECTED, cutoff),
+        ).fetchone()["n"]
+        ratio = recent_rejected / total if total else 0.0
+        if ratio > config.health_rejected_max_ratio:
+            reasons.append(
+                f"{recent_rejected} of {total} records ingested in the last"
+                f" {config.health_rejected_window_days}d were rejected"
+                f" ({ratio:.1%} > {config.health_rejected_max_ratio:.1%})"
+            )
 
         counts = {
             row["status"]: row["n"]
@@ -97,6 +115,13 @@ def create_app(config: Config | None = None) -> FastAPI:
             "last_successful_run": last_run,
             "last_sent_at": db.last_sent_at(conn),
             "record_counts": counts,
+            "recent_rejections": {
+                "window_days": config.health_rejected_window_days,
+                "rejected": recent_rejected,
+                "total": total,
+                "ratio": round(ratio, 4),
+                "max_ratio": config.health_rejected_max_ratio,
+            },
         }
 
     @app.get("/runs")

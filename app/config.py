@@ -43,6 +43,15 @@ class Config:
     mysql_password: str | None = None
     mysql_db: str | None = None
     deal_vidobes: str = "90"  # dir.15 "no collateral" — injected when a deal lacks it
+    # /health: rejections degrade the service only as a SHARE of the records
+    # ingested in the recent window. Every producer file carries ~0.3% bureau
+    # rejections (2090/2091/2056…), and old rejections never go away because a
+    # later file resends the subject as a NEW record — so "any rejected record
+    # ever" kept health permanently degraded (12610 on 2026-09-24, 96% of them
+    # superseded). The share still catches a mass failure like the 2026-07-22
+    # file (99.7% rejected with 2091).
+    health_rejected_window_days: int = 14   # ≈ one producer cycle
+    health_rejected_max_ratio: float = 0.02
 
     @property
     def archive_folder(self) -> Path:
@@ -98,4 +107,6 @@ def load_config() -> Config:
         mysql_password=os.environ.get("MYSQL_PASSWORD") or None,
         mysql_db=os.environ.get("MYSQL_DB") or None,
         deal_vidobes=os.environ.get("DEAL_VIDOBES", "").strip() or "90",
+        health_rejected_window_days=int(os.environ.get("HEALTH_REJECTED_WINDOW_DAYS") or 14),
+        health_rejected_max_ratio=float(os.environ.get("HEALTH_REJECTED_MAX_RATIO") or 0.02),
     )
